@@ -6,30 +6,30 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 
 ```
                     ┌─────────────────────────────┐
-                    │         main loop            │
-                    │   tokio::select! event hub   │
-                    └──────┬──────────────────┬────┘
+                    │         main loop           │
+                    │   tokio::select! event hub  │
+                    └──────┬──────────────────┬───┘
                            │                  │
-         ┌─────────────────┼──────────┐───────┼──────────┐
+         ┌────────────┐────┼──────────┐───────┼──────────┐
          ▼            ▼    ▼          ▼       ▼          ▼
     sys_tick      app_tick log_tick intel_tick agg_tick watchdog
      (10s)         (10s)   (15s)    (5min)    (1hr)    (30s)
          │            │      │        │         │        │
          ▼            ▼      ▼        ▼         ▼        ▼
-   ┌──────────┐ ┌────────┐ ┌─────┐ ┌────────┐ ┌──────┐ ┌─────────┐
-   │  sysinfo  │ │HTTP+PG │ │logs │ │baselines│ │rollups│ │staleness│
-   │  /proc    │ │scrape  │ │files│ │anomalies│ │retain │ │health   │
+   ┌──────────┐ ┌────────┐ ┌─────┐ ┌─────────┐ ┌───────┐ ┌─────────┐
+   │  sysinfo │ │HTTP+PG │ │logs │ │baselines│ │rollups│ │staleness│
+   │  /proc   │ │scrape  │ │files│ │anomalies│ │retain │ │health   │
    └─────┬────┘ └────┬───┘ │jrnl │ │SLOs     │ │log agg│ └────┬────┘
-         │           │     └──┬──┘ │recs     │ └───┬──┘      │
+         │           │     └──┬──┘ │recs     │ └───┬───┘      │
          │           │        │    │log anlys│     │          │
-         ▼           ▼        ▼    └────┬───┘     ▼          ▼
+         ▼           ▼        ▼    └────┬────┘     ▼          ▼
    ┌──────────────────────────────────────────────────────────────┐
-   │              MetricWriter + LogIngester (batched)             │
-   │  10 metric buffers + log batch INSERT on flush                │
+   │              MetricWriter + LogIngester (batched)            │
+   │  10 metric buffers + log batch INSERT on flush               │
    └──────────────────────────┬───────────────────────────────────┘
                               ▼
                         ┌───────────┐
-                        │ PostgreSQL │
+                        │ PostgreSQL│
                         └───────────┘
 ```
 
