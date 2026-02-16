@@ -300,3 +300,6 @@ The collector is designed to be lightweight despite 10s collection intervals:
 ## License
 
 MIT
+
+
+Live dashboard: https://pqcrypta.com/monitor/
