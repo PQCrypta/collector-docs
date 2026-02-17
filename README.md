@@ -41,7 +41,9 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 | `app_tick` | 10s | API metrics (HTTP scrape port 3003), proxy metrics (HTTP scrape port 8082), DB stats (direct pg_stat queries) |
 | `heartbeat_tick` | 5s | Lightweight liveness heartbeat (single INSERT) |
 | `log_tick` | 15s | Log ingestion from 13 file and journal sources, batch INSERT into `log_entries` |
-| `watchdog_tick` | 30s | Staleness detection, table health, process health, API error rate, DB response time |
+| `reconnect_tick` | 5s | DB health monitoring, automatic reconnection on connection loss |
+| `watchdog_tick` | 30s | Staleness detection, table health, process health, API error rate, DB response time, long queries, connection trend, IO pressure |
+| `config_tick` | 60s | Config file hot-reload (mtime-based change detection) |
 | `pg_extended_tick` | 5min | Per-table, per-index, IO, replication, statement stats |
 | `intel_tick` | 5min | Intelligence layer: baselines, anomaly detection, SLO computation, recommendations, log pattern analysis, error spike detection, security event detection |
 | `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 7d, hourly 90d, daily 2yr), baseline recomputation, SLO computation, log metric aggregation, log data cleanup |
@@ -66,14 +68,17 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 ### `src/db/`
 
-**`writer.rs`** — `MetricWriter` with 10 typed `Vec` buffers (system, process, API, proxy, DB, table, index, IO, replication, statement). Each `push_*` method appends to the buffer. `flush()` builds bulk `INSERT` statements with `$1..$N` parameter binding and executes them in a single round-trip per table. Buffers are cleared after successful flush.
+**`writer.rs`** — `MetricWriter` with 10 typed `VecDeque` ring buffers (system, process, API, proxy, DB, table, index, IO, replication, statement). Each `push_*` method appends to the buffer; when a buffer reaches `max_capacity` (batch_size × 20), the oldest entry is evicted to prevent unbounded memory growth during DB outages. `flush()` wraps all INSERTs in a `BEGIN`/`COMMIT` transaction with per-query timeout protection. On any error, `ROLLBACK` is executed and buffers are restored so no data is lost. `should_flush()` checks all 10 buffers (not just 3).
+
+**`helpers.rs`** — `timed_execute()` wraps `client.execute()` with a `tokio::time::timeout` to prevent stuck queries from blocking the event loop indefinitely.
 
 **`retention.rs`** — Time-series aggregation and cleanup:
 - **Hourly rollups**: Aggregates raw rows from the past hour into `*_hourly` tables using `AVG`, `MAX`, `MIN`. Covers system, process, API, DB, table, and IO metrics. Uses `ON CONFLICT (bucket) DO UPDATE` for idempotent upserts.
   - **Cumulative counter handling**: API metrics `total_requests` and `failed_requests` are cumulative counters — the hourly rollup uses `GREATEST(max(col) - min(col), 0)` to compute per-hour deltas instead of `sum()`, which would produce inflated counts from cumulative snapshots.
   - **DB response time**: Includes `avg(db_response_ms)` in the API hourly rollup for baseline tracking.
 - **Daily rollups**: Aggregates hourly rows from the past day into `*_daily` tables.
-- **Retention cleanup**: Deletes raw data older than 7 days, hourly data older than 90 days, daily data older than 2 years. Also cleans resolved alerts older than 30 days and old insights/recommendations.
+- **Retention cleanup**: Deletes raw data older than 7 days, hourly data older than 90 days, daily data older than 2 years.
+- **Consolidated cleanup** (hourly): Removes heartbeats older than 24 hours, resolved alerts older than 7 days, resolved insights older than 7 days. Moved from the 30s watchdog tick to reduce unnecessary frequency.
 
 ### `src/intelligence.rs`
 
@@ -224,12 +229,15 @@ Health monitoring runs on a dedicated 30s tick, decoupled from the 5s heartbeat:
 - **Process health** (30s): Checks for high CPU (> 50%), high memory (> 1GB RSS), high FDs (> 1000), high threads (> 500), bad states (zombie/D-state/stopped), and expected processes that are missing. Condition-based auto-resolve: when a process metric returns to healthy, its alert is resolved immediately (no time-based delay).
 - **API error rate** (30s): Alerts if error rate exceeds 5% with > 100 total requests. Auto-resolves when error rate drops below threshold.
 - **DB response time** (30s): Alerts if 5-minute average DB response time exceeds 100ms. Auto-resolves when response time drops below threshold.
+- **Long queries** (30s): Queries `pg_stat_activity` for queries running > 30 seconds. Records `long_query` alert with PID, duration, and truncated query text. Auto-resolves when no long queries detected.
+- **Connection trend** (30s): Compares current active connection count to 1 hour ago. Alerts `connection_leak` if connections increased by >50% AND current count exceeds 80% of `max_connections`. Auto-resolves when condition clears.
+- **IO pressure** (30s): Checks for `load_1 > 8.0` combined with high checkpoint write time (>1000ms) or high buffers_backend (>100). Records `io_pressure` alert when both CPU and IO conditions are met. Auto-resolves when conditions clear.
 
 All watchdog alerts use deduplication (matching alert type + subject prefix) and have both condition-based and time-based auto-resolution fallbacks.
 
 ### `src/config.rs`
 
-TOML configuration with environment variable overrides. Default path: `/etc/pqcrypta/collector.toml`.
+TOML configuration with environment variable overrides. Default path: `/etc/pqcrypta/collector.toml`. Supports hot-reload: every 60 seconds the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout, intervals, retention days) without restart. DB credentials require a full restart.
 
 ```toml
 [database]
@@ -255,6 +263,7 @@ daily_days = 365
 
 [collector]
 batch_size = 50
+query_timeout_secs = 10  # env: QUERY_TIMEOUT_SECS — per-query timeout to prevent stuck queries blocking the event loop
 processes = ["pqcrypta-api", "pqcrypta-proxy", "pqcrypta-collector", "postgres", "apache2", "php-fpm"]
 
 [logs]
@@ -345,6 +354,18 @@ cp target/release/pqcrypta-collector /usr/local/bin/
 - Proxy server running on port 8082 with `/metrics` endpoint (optional)
 - Read access to log files in `/var/log/` (auth.log, kern.log, postgresql, apache2, fail2ban, letsencrypt, pqcrypta-proxy)
 - `journalctl` available for systemd journal sources (pqcrypta-api, pqcrypta-proxy, pqcrypta-collector)
+
+## Resilience
+
+The collector is hardened for production reliability:
+
+- **Graceful DB reconnection**: If the PostgreSQL connection drops, the collector continues collecting metrics in memory. A `reconnect_tick` (5s) attempts reconnection using a `tokio::sync::watch` health channel. On reconnect, schema is verified and buffered data is flushed. No `std::process::exit` — the process stays alive.
+- **Ring buffer backpressure**: All 10 metric buffers use `VecDeque` with `max_capacity = batch_size × 20`. When a buffer hits capacity during a DB outage, the oldest entry is evicted. Dropped counts are logged on the next successful flush.
+- **Transaction-wrapped flushes**: All INSERTs in a flush cycle are wrapped in `BEGIN`/`COMMIT`. On any error, `ROLLBACK` is executed and buffers are restored so no data is lost.
+- **Query timeout protection**: Every DB query uses `tokio::time::timeout` (default 10s, configurable via `query_timeout_secs`). Prevents stuck queries from blocking the single-threaded event loop.
+- **Config hot-reload**: Every 60s the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout, intervals, retention days) without restart.
+- **Log rotation detection**: Handles both standard log rotation (inode change) and copytruncate rotation (file size shrinkage between ticks) via `last_file_size` tracking.
+- **Baseline NULL filtering**: Statistical baselines skip NULL, NaN, and Inf values to prevent pollution from incomplete data windows.
 
 ## Resource Usage
 
