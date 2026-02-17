@@ -1,6 +1,6 @@
 # pqcrypta-collector
 
-Async metrics collector, log ingestion engine, and intelligence layer for PQCrypta infrastructure. Single-threaded Rust binary that scrapes system, process, application, and database metrics on configurable intervals, ingests logs from 13 sources with structured parsing, writes everything to PostgreSQL with batched inserts, performs time-series aggregation and retention, and runs statistical anomaly detection with SLO tracking and actionable recommendations.
+Async metrics collector, log ingestion engine, and intelligence layer for PQCrypta infrastructure. Single-threaded Rust binary that scrapes system, process, application, and database metrics on configurable intervals, ingests logs from 13 sources with structured parsing, writes everything to PostgreSQL with batched inserts, performs time-series aggregation and retention, runs statistical anomaly detection with SLO tracking and actionable recommendations, and provides disk-backed durable queuing with cardinality protection.
 
 ## Architecture
 
@@ -26,11 +26,13 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
    ┌──────────────────────────────────────────────────────────────┐
    │              MetricWriter + LogIngester (batched)             │
    │  10 metric buffers + log batch INSERT on flush                │
-   └──────────────────────────┬───────────────────────────────────┘
-                              ▼
-                        ┌───────────┐
-                        │ PostgreSQL │
-                        └───────────┘
+   │  disk-backed spill queue (JSONL) on overflow                  │
+   └──────────┬──────────────────────────────┬────────────────────┘
+              ▼                              ▼
+        ┌───────────┐               ┌────────────────┐
+        │ PostgreSQL │               │ Disk Queue     │
+        └───────────┘               │ (queue.jsonl)  │
+                                    └────────────────┘
 ```
 
 ### Tick intervals
@@ -46,7 +48,7 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 | `config_tick` | 60s | Config file hot-reload (mtime-based change detection) |
 | `pg_extended_tick` | 5min | Per-table, per-index, IO, replication, statement stats |
 | `intel_tick` | 5min | Anomaly detection, recommendations, log pattern analysis, error spike detection, security event detection |
-| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup |
+| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup, stale cardinality pruning, fingerprint budget reset |
 
 The fast-path ticks (sys, app, heartbeat) are designed for negligible resource impact:
 - `sysinfo` reads from `/proc` (kernel shared memory, no disk I/O)
@@ -68,7 +70,9 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 ### `src/db/`
 
-**`writer.rs`** — `MetricWriter` with 10 typed `VecDeque` ring buffers (system, process, API, proxy, DB, table, index, IO, replication, statement). Each `push_*` method appends to the buffer; when a buffer reaches `max_capacity` (batch_size × 20), the oldest entry is evicted to prevent unbounded memory growth during DB outages. `flush()` wraps all INSERTs in a `BEGIN`/`COMMIT` transaction with per-query timeout protection. On any error, `ROLLBACK` is executed and buffers are restored so no data is lost. `should_flush()` checks all 10 buffers (not just 3).
+**`writer.rs`** — `MetricWriter` with 10 typed `VecDeque` ring buffers (system, process, API, proxy, DB, table, index, IO, replication, statement) and a disk-backed spill queue. Each `push_*` method appends to the buffer; when a buffer reaches `max_capacity` (batch_size × 20), the oldest entry is serialized to the disk queue instead of being dropped. `flush()` wraps all INSERTs in a `BEGIN`/`COMMIT` transaction with per-query timeout protection; after successful commit, any spilled records are drained from disk and flushed in batches. On any error, `ROLLBACK` is executed and buffers are restored. `spill_all_to_disk()` drains all 10 in-memory buffers to disk at shutdown when DB is unhealthy. `drain_all_spilled()` recovers spilled data from a previous run on startup.
+
+**`disk_queue.rs`** — Disk-backed durable queue for metric spill during DB outages. Uses a single append-only JSONL file (`queue.jsonl`) with tagged serde (`SpilledRecord` enum covering all 10 metric types). `spill()` appends a JSON line with disk budget enforcement (default 100MB). `drain(batch_size)` reads records from the front and atomically rewrites the remainder via temp file + rename. Configurable via `queue_dir` (default `/var/lib/pqcrypta-collector/queue`) and `queue_max_mb` (default 100).
 
 **`helpers.rs`** — `timed_execute()` wraps `client.execute()` with a `tokio::time::timeout` to prevent stuck queries from blocking the event loop indefinitely.
 
@@ -79,21 +83,26 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 - **Daily rollups**: Aggregates hourly rows from the past day into `*_daily` tables.
 - **Retention cleanup**: Deletes raw data older than configured days (default 14), hourly data older than configured days (default 90), daily data older than configured days (default 365).
 - **Consolidated cleanup** (hourly): Removes heartbeats older than 24 hours, resolved alerts older than 7 days, resolved insights older than 7 days. Moved from the 30s watchdog tick to reduce unnecessary frequency.
+- **Cardinality pruning** (hourly): Deletes stale `log_patterns` not seen in 7 days and stale `baselines` not updated in 30 days to prevent unbounded table growth.
 
 ### `src/intelligence.rs`
 
 Statistical intelligence engine with `Severity` enum (`Info`, `Warn`, `Critical`) for type-safe alert classification:
 
-**Baselines** (runs on `agg_tick`, hourly) — Computes 7-day and 30-day rolling mean, stddev, and percentiles (p5/p25/p50/p75/p95) for 25 global metrics across 5 domains plus dynamic per-table `dead_tup_ratio`. Stores in `collector.baselines` with `ON CONFLICT` upsert. Requires minimum 6 samples before establishing a baseline. Skips NULL, NaN, and Inf values to prevent pollution from incomplete data windows.
+**Baselines** (runs on `agg_tick`, hourly) — Computes 7-day and 30-day rolling mean, stddev, and percentiles (p5/p25/p50/p75/p95) for 43 global metrics across 9 domains plus dynamic per-table `dead_tup_ratio`. Stores in `collector.baselines` with `ON CONFLICT` upsert. Requires minimum 6 samples before establishing a baseline. Skips NULL, NaN, and Inf values to prevent pollution from incomplete data windows.
 
 | Domain | Metrics |
 |--------|---------|
 | system | `cpu_system`, `load_1`, `mem_used_pct` |
-| api | `p95_ms`, `rps`, `error_rate_pct`, `p99_ms`, `db_response_ms` |
-| db | `cache_hit_ratio`, `active_conn`, `deadlocks`, `slow_queries`, `waiting_conn`, `blks_read`, `wal_bytes` |
-| proxy | `latency_p95_ms`, `request_server_errors`, `latency_p50_ms`, `conn_active`, `handshake_failures`, `rl_requests_blocked` |
+| api | `p95_ms`, `rps`, `error_rate_pct`, `p99_ms`, `db_response_ms`, `active_connections` |
+| db | `cache_hit_ratio`, `active_conn`, `deadlocks`, `slow_queries`, `waiting_conn`, `blks_read`, `wal_bytes`, `xact_rollback`, `buffers_backend`, `checkpoint_write_time` |
+| proxy | `latency_p95_ms`, `request_server_errors`, `latency_p50_ms`, `conn_active`, `handshake_failures`, `rl_requests_blocked`, `conn_total`, `request_client_errors` |
 | logs | `error_count`, `warn_count`, `total_count`, `error_rate_pct` |
-| table (dynamic) | `dead_tup_ratio` per table (computed separately for each table with sufficient history) |
+| process | `cpu_pct_max`, `rss_max`, `fd_avg` (MAX/AVG across all tracked processes per hour) |
+| io | `read_time`, `write_time`, `evictions` (SUM across backend types per hour from `pg_stat_io`) |
+| replication | `replay_lag_ms`, `flush_lag_ms` (MAX lag across slots — worst-case replication health) |
+| statement | `mean_exec_time_ms`, `temp_blks_written` (aggregate across top-N queries from `pg_stat_statements`) |
+| table (dynamic) | `dead_tup_ratio` per table (top 200 by activity, computed separately for each table with sufficient history) |
 
 **Anomaly detection** (runs on `intel_tick`, every 5 min) — For each baselined metric, fetches the latest raw value and computes:
 - Z-score: `(value - mean) / stddev`
@@ -106,16 +115,21 @@ Includes per-table anomaly detection for dead tuple ratio baselines. Deduplicate
 
 **Lower-is-better suppression** — For metrics where a decrease is an improvement (not an anomaly), large negative drifts (>50%) are suppressed:
 - `logs/error_count`, `logs/warn_count`, `logs/error_rate_pct`
-- `db/slow_queries`, `db/deadlocks`, `db/waiting_conn`
-- `proxy/request_server_errors`, `proxy/handshake_failures`, `proxy/rl_requests_blocked`
+- `db/slow_queries`, `db/deadlocks`, `db/waiting_conn`, `db/xact_rollback`, `db/buffers_backend`, `db/checkpoint_write_time`
+- `proxy/request_server_errors`, `proxy/handshake_failures`, `proxy/rl_requests_blocked`, `proxy/request_client_errors`
+- `io/read_time`, `io/write_time`
+- `replication/replay_lag_ms`, `replication/flush_lag_ms`
+- `statement/temp_blks_written`
 - `table/dead_tup_ratio` (a drop means vacuum worked)
 
-**Cross-domain correlation** — When 2+ anomalies from different domains co-occur in the same detection cycle, a `correlation` insight is generated linking them (e.g., API latency spike + DB cache drop + proxy error increase noted as a single correlated event). Rate-limited to one correlation insight per 30 minutes.
+**Cross-domain metric correlation** — When 2+ anomalies from different domains co-occur in the same detection cycle, a `correlation` insight is generated linking them (e.g., API latency spike + DB cache drop + proxy error increase noted as a single correlated event). Rate-limited to one correlation insight per 30 minutes.
+
+**Log-metric cross-correlation** — When a log error spike coincides with metric anomalies from other domains, a `log_metric_correlation` insight is generated with causal hypothesis tagging. The system identifies likely root causes based on which domains are affected (e.g., "Database performance issue may be propagating to application errors" when log spikes co-occur with DB anomalies). Rate-limited to one per 30 minutes.
 
 **SLO tracking** (runs on `agg_tick`, hourly) — Four SLOs with 30-day sliding window:
 - `api_uptime`: Target 99.9% — counts periods where `(total - failed) / total` falls below 99.9%
 - `api_latency_p95`: Target 500ms — counts periods where p95 > 500ms
-- `api_latency_p99`: Target 2000ms — counts periods where p99 > 2000ms (99% reliability target)
+- `api_latency_p99`: Target 2000ms — counts periods where p99 > 2000ms (99.0% error budget, vs 99.9% for other SLOs)
 - `db_cache_hit`: Target 99% — counts periods where cache hit ratio < 99%
 
 Computes error budget as `violations / allowed_violations * 100`. Generates `slo_violation` insights when SLOs are not met. Skipped for the first 10 minutes after collector restart to avoid counting the deployment gap as a violation.
@@ -124,7 +138,7 @@ Computes error budget as `violations / allowed_violations * 100`. Generates `slo
 
 | Category | Target | Trigger | Severity |
 |----------|--------|---------|----------|
-| vacuum | `{schema}.{table}` | Dead tuples > 20% (warn), > 50% (crit) | warn/critical |
+| vacuum | `{schema}.{table}` | Dead tuples > 20% (warn), > 50% (crit); requires ≥1000 live rows | warn/critical |
 | system | cpu | CPU > 80% (warn), > 95% (crit) | warn/critical |
 | system | memory | Memory > 85% (warn), > 95% (crit) | warn/critical |
 | system | load | Load avg > 4.0 | warn |
@@ -196,7 +210,7 @@ Streaming log ingestion engine that polls 13 sources every 15 seconds:
 6. **fail2ban** — `YYYY-MM-DD HH:MM:SS,mmm fail2ban.module [pid]: LEVEL message`
 7. **certbot** — `YYYY-MM-DD HH:MM:SS,mmm:LEVEL:module:message`
 
-**Fingerprinting** — Normalizes messages (digits to `#`, IPs to `<IP>`, UUIDs to `<UUID>`), hashes with SHA-256 truncated to 16 hex chars: `sha256(source|level|normalized)[..16]`.
+**Fingerprinting** — Normalizes messages (digits to `#`, IPs to `<IP>`, UUIDs to `<UUID>`), hashes with SHA-256 truncated to 16 hex chars: `sha256(source|level|normalized)[..16]`. A per-source cardinality budget (default 1000 unique fingerprints) prevents unbounded memory growth from high-cardinality log sources. New fingerprints beyond the budget are silently dropped. The budget resets hourly on `agg_tick`, with skip counts logged at `warn` level before clearing.
 
 ### `src/log_analysis.rs`
 
@@ -244,7 +258,7 @@ All watchdog alerts use deduplication (matching alert type + subject prefix) and
 
 ### `src/config.rs`
 
-TOML configuration with environment variable overrides. Default path: `/etc/pqcrypta/collector.toml` (override via `COLLECTOR_CONFIG` env var). Supports hot-reload: every 60 seconds the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout_secs, system_secs, app_secs, raw_days, hourly_days, daily_days) without restart. DB credentials, heartbeat interval, processes, scrape URLs, and log config require a full restart.
+TOML configuration with environment variable overrides. Default path: `/etc/pqcrypta/collector.toml` (override via `COLLECTOR_CONFIG` env var). Supports hot-reload: every 60 seconds the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout_secs, system_secs, app_secs, raw_days, hourly_days, daily_days) without restart. DB credentials, heartbeat interval, processes, scrape URLs, log config, queue_dir, queue_max_mb, and max_fingerprints_per_source require a full restart.
 
 ```toml
 [database]
@@ -271,6 +285,9 @@ daily_days = 365          # env: DAILY_RETENTION_DAYS
 [collector]
 batch_size = 50           # env: BATCH_SIZE
 query_timeout_secs = 10   # env: QUERY_TIMEOUT_SECS — per-query timeout to prevent stuck queries blocking the event loop
+queue_dir = "/var/lib/pqcrypta-collector/queue"  # env: QUEUE_DIR — disk spill directory
+queue_max_mb = 100        # env: QUEUE_MAX_MB — max disk budget for spill queue
+max_fingerprints_per_source = 1000  # env: MAX_FINGERPRINTS_PER_SOURCE — cardinality limit per log source
 processes = ["pqcrypta-proxy", "pqcrypta-api", "pqcrypta-collector", "postgres", "apache2", "php-fpm"]
 
 [logs]
@@ -377,12 +394,86 @@ The service file runs the binary from `target/release/` directly. Alternatively,
 The collector is hardened for production reliability:
 
 - **Graceful DB reconnection**: If the PostgreSQL connection drops, the collector continues collecting metrics in memory. A `reconnect_tick` (5s) attempts reconnection using a `tokio::sync::watch` health channel. On reconnect, schema is verified and buffered data is flushed. No `std::process::exit` — the process stays alive.
-- **Ring buffer backpressure**: All 10 metric buffers use `VecDeque` with `max_capacity = batch_size × 20`. When a buffer hits capacity during a DB outage, the oldest entry is evicted. Dropped counts are logged on the next successful flush.
+- **Disk-backed durable queue**: When in-memory ring buffers overflow during a DB outage, evicted records are serialized to a JSONL file on disk (default 100MB budget) instead of being dropped. On successful DB reconnection, spilled records are drained back and flushed in batches. At shutdown with an unhealthy DB, all in-memory buffers are spilled to disk for recovery on next startup.
+- **Ring buffer backpressure**: All 10 metric buffers use `VecDeque` with `max_capacity = batch_size × 20`. When a buffer hits capacity during a DB outage, the oldest entry is spilled to the disk queue. Spill counts are logged on the next successful flush.
 - **Transaction-wrapped flushes**: All INSERTs in a flush cycle are wrapped in `BEGIN`/`COMMIT`. On any error, `ROLLBACK` is executed and buffers are restored so no data is lost.
 - **Query timeout protection**: Every DB query uses `tokio::time::timeout` (default 10s, configurable via `query_timeout_secs`). Prevents stuck queries from blocking the single-threaded event loop.
 - **Config hot-reload**: Every 60s the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout, intervals, retention days) without restart.
 - **Log rotation detection**: Handles both standard log rotation (inode change) and copytruncate rotation (file size shrinkage between ticks) via `last_file_size` tracking.
 - **Baseline NULL filtering**: Statistical baselines skip NULL, NaN, and Inf values to prevent pollution from incomplete data windows.
+- **Cardinality protection**: Per-source fingerprint budget (default 1000) prevents log ingestion from creating unbounded unique entries. Per-table baseline computation is limited to the top 200 tables by activity. Stale log patterns (>7d) and baselines (>30d) are pruned hourly.
+
+## Security Model
+
+### Connection Security
+
+The collector operates entirely on localhost with no listening ports:
+- **Database**: Connects to PostgreSQL on `localhost:5432` via Unix domain socket or TCP loopback. No remote DB connections by default.
+- **HTTP scraping**: Fetches metrics from `127.0.0.1:3003` (API) and `127.0.0.1:8082` (proxy) — loopback only, no external network access.
+- **Journal access**: Reads from local systemd journal via `journalctl` subprocess.
+- **File access**: Reads log files from local filesystem (`/var/log/`).
+- **No listening sockets**: The collector binary does not bind any ports or accept any inbound connections.
+
+### Secret Handling
+
+- **Config file**: `/etc/pqcrypta/collector.toml` with recommended permissions `0600 root:root`. Contains database credentials.
+- **Environment variable overrides**: All sensitive fields (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS) can be set via environment variables, avoiding config file storage entirely.
+- **systemd integration**: Environment variables can be set in the service unit file or via `EnvironmentFile=` pointing to a restricted credentials file.
+- **No hardcoded secrets**: Zero credentials in source code. All secrets come from config file or environment at runtime.
+- **Memory handling**: Database password is held in a `String` field — not persisted to disk beyond the config file.
+
+### Query Safety
+
+- **Parameterized queries**: All database writes use `$1, $2, ...` parameterized queries via `tokio-postgres`. No string interpolation of user-controlled data into SQL.
+- **Query timeouts**: Every database operation is wrapped in `tokio::time::timeout` (default 10s, configurable) to prevent stuck queries from blocking the event loop.
+- **Schema-qualified tables**: All table references use the `collector.` schema prefix, preventing accidental cross-schema access.
+- **Transaction wrapping**: All flush operations use explicit `BEGIN`/`COMMIT`/`ROLLBACK` for atomicity. Failed writes trigger rollback and buffer restoration.
+- **Read-only external access**: HTTP metric scraping and log file reads are read-only operations. The collector never writes to external services.
+
+### Data Classification
+
+| Data Type | Sensitivity | Retention | Notes |
+|-----------|-------------|-----------|-------|
+| System metrics (CPU, memory, load) | Low | 14d raw, 90d hourly, 365d daily | No PII |
+| Process metrics (names, PIDs, CPU, RSS) | Low | 14d raw, 90d hourly | Process names only, no arguments |
+| API/Proxy metrics (latency, error rates) | Low | 14d raw, 90d hourly | Aggregate counters, no request content |
+| Database metrics (connections, cache, WAL) | Low | 14d raw, 90d hourly | Statistical aggregates only |
+| Log entries (messages, timestamps) | Medium | 7d | May contain IPs, usernames, error details |
+| Log fingerprints | Low | 30d after resolved | SHA-256 hashes of normalized messages |
+| Security events (IPs, ban actions) | Medium | 30d | Source IPs from fail2ban/auth logs |
+| Baselines/anomalies | Low | 30d stale pruning | Statistical summaries |
+| Database credentials | High | Runtime only | In config file or env vars |
+
+### Threat Model
+
+**In scope:**
+- **Database credential exposure**: Mitigated by file permissions (0600), env var overrides, and localhost-only connections.
+- **PII in log messages**: Log messages may contain IP addresses, usernames, or error context. Mitigated by 7-day retention, fingerprint normalization (IPs → `<IP>`, UUIDs → `<UUID>`), and message truncation (4096 char limit).
+- **Config file exposure**: Mitigated by restrictive file permissions and systemd sandboxing.
+- **Cardinality DoS**: Malicious or runaway log sources could generate unbounded unique fingerprints. Mitigated by per-source fingerprint budget (default 1000), per-table baseline limit (top 200), and stale cardinality pruning.
+- **Disk exhaustion from spill queue**: Mitigated by configurable disk budget (default 100MB) with hard cap enforcement.
+
+**Out of scope:**
+- **Host compromise**: If an attacker has root access to the host, all bets are off. The collector assumes the host OS is trusted.
+- **Network-level attacks**: The collector has no listening ports and makes only localhost connections. Network attacks require compromising the loopback interface.
+- **PostgreSQL server compromise**: The collector trusts the database server. A compromised PostgreSQL instance could return malicious data, but the collector only reads statistical views.
+
+### Hardening Recommendations
+
+- **File permissions**: Ensure `/etc/pqcrypta/collector.toml` is `0600 root:root`. Ensure the queue directory (`/var/lib/pqcrypta-collector/queue`) is `0700` owned by the service user.
+- **Dedicated DB user**: Use a dedicated `pqcrypta_collector` database user with minimal privileges: `CONNECT` on the database, `USAGE` and `CREATE` on the `collector` schema, `SELECT` on `pg_stat_*` views, `INSERT`/`UPDATE`/`DELETE` on collector tables.
+- **TLS for remote DB**: If the database is on a separate host, configure `sslmode=verify-full` in the connection string and provide CA certificates.
+- **Disk encryption**: Use LUKS or dm-crypt for the queue directory partition to protect spilled metrics at rest.
+- **systemd sandboxing**: The provided service unit includes `MemoryMax=64M` and `CPUQuota=5%`. Consider adding:
+  ```ini
+  ProtectSystem=strict
+  ProtectHome=true
+  ReadWritePaths=/var/lib/pqcrypta-collector
+  ReadOnlyPaths=/etc/pqcrypta /var/log
+  PrivateTmp=true
+  NoNewPrivileges=true
+  ```
+- **Log rotation**: Ensure all monitored log files have rotation configured (logrotate) to prevent unbounded growth. The collector handles both standard rotation (inode change) and copytruncate rotation.
 
 ## Resource Usage
 
