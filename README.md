@@ -279,8 +279,8 @@ TOML configuration with environment variable overrides. Default path: `/etc/pqcr
 [database]
 host = "localhost"        # env: DB_HOST
 port = 5432               # env: DB_PORT
-name = "pqcrypta"         # env: DB_NAME
-user = "pqcrypta_user"    # env: DB_USER
+name = "mydb"             # env: DB_NAME
+user = "myuser"           # env: DB_USER
 password = ""             # env: DB_PASS
 
 [intervals]
