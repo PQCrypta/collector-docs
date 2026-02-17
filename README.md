@@ -475,6 +475,256 @@ The collector operates entirely on localhost with no listening ports:
   ```
 - **Log rotation**: Ensure all monitored log files have rotation configured (logrotate) to prevent unbounded growth. The collector handles both standard rotation (inode change) and copytruncate rotation.
 
+## Dashboard UI
+
+The monitoring dashboard at `/monitor/` renders all collector data across 10 tabs with 150+ metrics, 20+ charts, 15+ tables, and interactive filtering. Built with vanilla JS, Canvas-based charts, and strict CSP (no inline styles/scripts). Auto-refreshes on three tiers: 10s full data, 5s badge poll, 1s ticker interpolation.
+
+### Header & Quick Stats
+
+**Header badges** (always visible):
+- **Heartbeat**: Time since last collector heartbeat with color dot (green <30s, yellow <60s, red >60s)
+- **Updated**: Last full data refresh timestamp
+- **Uptime**: API server uptime (locally interpolated every 1s between refreshes)
+- **Alerts**: Active alert count (clickable — navigates to Alerts tab)
+
+**Quick stats bar** (6 cards with sparklines below tabs):
+
+| Card | Source | Sparkline | Color Thresholds |
+|------|--------|-----------|-----------------|
+| CPU Usage | `cpu_system` from `system_latest` | 120-point history (green) | Warn 70%, Error 90% |
+| Memory | `mem_used / mem_total` | 120 points (cyan) | Warn 80%, Error 95% |
+| Load Avg (1m) | `load_1` | 120 points (orange) | None (varies by core count) |
+| API RPS | `rps` from `api_latest` | 120 points (green) | None |
+| DB Cache Hit | `cache_hit_ratio` from `db_latest` | 120 points (cyan) | Warn <99%, Error <95% (inverted) |
+| Heartbeat | Visual (SVG) | 3D animated heart (alive) or broken heart with flatline (dead) | Binary alive/dead |
+
+### Tab 0: System
+
+**System overview** (8 detail cards): CPU usage, memory used/available, swap, load 1m/5m/15m, network RX/TX, CPU idle. Color thresholds on CPU (70/80%), memory (75/85%), swap (50/80%).
+
+**Charts** (4 line charts in 2x2 grid):
+- CPU Usage — `cpu_system` history (120 points)
+- Memory (GB) — used (cyan) + available (green)
+- Load Average — 1m/5m/15m (green/cyan/orange)
+- Network I/O Rate — RX/TX bytes delta (green/orange)
+
+**Disk usage**: Dynamic card grid (one per mount, filtered to exclude snap.rootfs) + horizontal bar chart. Color: green <75%, orange 75-85%, red >85%.
+
+### Tab 1: Processes
+
+**Filter bar** (7 toggle buttons with severity badges): All, Issues Only, High CPU (20/50/80%), High RSS (256MB/512MB/1GB), High FDs (200/500/1000), Threads (100/200/500), Bad State (T=stopped warn, Z=zombie/D=disk-wait error).
+
+**Process table** (9 columns): Process, PID, CPU%, RSS, VSZ, FDs, Threads, State, Uptime. Sorted by severity descending, then CPU% descending. Each cell individually color-coded against its threshold. Searchable via MonTables with real-time badge count updates.
+
+### Tab 2: API & Proxy
+
+**API server status** (12 detail cards): Uptime, RPS, total/successful/failed requests, error rate (warn 1%, error 5%), avg response, active connections/sessions, CPU%, memory, throughput. Failed requests card is clickable — scrolls to error breakdown.
+
+**API performance charts** (2 line charts):
+- RPS & Error Rate — with threshold lines at 1% (orange) and 5% (red zone)
+- Latency p50/p95/p99 — with threshold lines at 200ms (green), 500ms (orange SLO), 1000ms (red zone)
+
+**Failed requests breakdown** — loaded on demand via AJAX (`api.php?mode=api_errors`):
+- Two-row header: group headers + individual HTTP status code columns (400, 401, 403, 404, 405, 408, 409, 413, 422, 429, 500, 502, 503, 504)
+- Filter badges per status code (yellow for 4xx, red for 5xx)
+- Columns: Endpoint, Total, per-code cells, Last Seen, Share %
+
+**Recent failures table** (3 columns): Time, Status code, Endpoint. Last 50 failures.
+
+**API database connection** (3 cards): DB connections, DB response time (warn >50ms, error >100ms), DB cache hit ratio (error <95%, warn <99%).
+
+**Proxy statistics** (8 cards): Uptime, total requests, success, client errors (clickable), server errors (clickable), in progress, bytes RX/TX.
+
+**Proxy connections** (3 cards): Total connections (`conn_total`), active connections (`conn_active`), handshake failures (`handshake_failures`, error-colored, warn >1, error >10).
+
+**Proxy latency** (3 cards): p50 (warn >200ms, error >500ms), p95 (warn >500ms, error >1000ms), p99 (warn >1000ms, error >2000ms).
+
+**HTTP versions & TLS** (8 cards): HTTP/3, HTTP/2, HTTP/1.1, WebTransport counts; TLS total, PQC handshakes (green), classical handshakes, PQC enabled (YES/NO).
+
+**Rate limiter** (4 cards): Checked, allowed (green), rate limited (yellow), blocked (red).
+
+**Proxy error breakdown** — loaded on demand via AJAX (`api.php?mode=proxy_errors&type=client|server`):
+- Filter badges per status code
+- Columns: Endpoint, Errors, Last Status, Last Seen
+
+### Tab 3: PostgreSQL
+
+**Cache hit gauge**: Radial gauge 0-100%. Thresholds: red <90%, orange 90-97%, green >97%.
+
+**Connections & activity** (9 cards): Active (green), idle, waiting (warn >1, error >5), commits, rollbacks, deadlocks (error if >0), slow queries (warn >1, error >5), total locks, waiting locks (warn >1, error >5).
+
+**Charts** (3 charts):
+- Transactions — commit (green) vs rollback (red) line chart, 120 points
+- Wait events — pie/donut chart (IO/Lock/LWLock/BufferPin/Activity/Client/IPC/Timeout), only non-zero segments
+- Lock distribution — horizontal bar chart (7 lock types: AccessShare through AccessExclusive)
+
+**Checkpointer** (7 cards): Timed, requested, write time, sync time, buffers checkpoint/clean/backend.
+
+**WAL statistics** (5 cards): WAL records, WAL bytes, full page images, write time, sync time.
+
+### Tab 4: Tables & Indexes
+
+**Top tables by size** (9 columns): Table, Size, Live/Dead tuples, Bloat % (green <10%, yellow 10-20%, red >20%), Seq/Idx scans, Last vacuum, Last analyze. Top 30 by total_size_bytes descending.
+
+**Tables needing vacuum** (4 columns): Table, Dead tuples, Dead/Live %, Last vacuum. Filtered to live_tup >100 AND dead/live >10%. Empty state: "All tables within healthy thresholds".
+
+**Unused indexes** (4 columns): Table, Index, Size, Scans (=0). Sorted by size descending. Empty state: "All indexes are being used".
+
+### Tab 5: Queries
+
+**Top 20 queries** (14 columns): Rank, Total time, Calls, Mean (warn >500ms, error >1s), Max (warn >2s, error >5s), Rows, Blk hit, Blk read, Temp read (warn >0, error >1000), Temp write (warn >0, error >1000), Blk read time, Blk write time, WAL records, Query text (sanitized, truncated to 120 chars, full in tooltip). Query text sanitization replaces passwords, API keys, secrets, tokens, credentials with `***`.
+
+**I/O by backend type** — stacked horizontal bar chart: Reads (green) / Writes (orange) / Hits (cyan), one bar per backend type (autovacuum, checkpointer, client backend, walwriter, etc.). Dynamic height.
+
+**I/O summary** (5 cards): Total read time, total write time, total evictions, total fsyncs, overall hit ratio. Aggregated across all backend types.
+
+**I/O detail table** (12 columns): Backend type, Object, Context, Reads, Read time, Writes, Write time, Hits, Evictions, Reuses, Fsyncs, Fsync time. Full `pg_stat_io` breakdown, compact font (0.85em).
+
+### Tab 6: Logs
+
+**Log health** — error rate gauge (current hour, thresholds: red >5%, orange >2%, green <2%) + pie chart (errors by source, 24h).
+
+**Log overview** (6 cards): Total logs (24h), errors (clickable, red), warnings (clickable, yellow), active patterns, error rate %, security events.
+
+**Source health grid** — dynamic card per source with 24h stats: total, errors, warns, error rate, trend (up/down/stable vs previous 24h), last error timestamp, top error message. Per-source detail: errors_1h, warns_1h, total_1h. Clickable for source-specific view.
+
+**Error rate trend chart** — line chart with dual Y-axis: error rate % (left) + total volume (right), 24 hourly buckets. Baseline threshold line from 7-day `log_baselines`.
+
+**Log volume chart** — stacked bar chart by level per hour (error=red, warn=orange, info=green, debug=gray), 24h.
+
+**Security events table** (5 columns): Time, Type, IP, Details, Count. Aggregated by event_type + source_ip. Types: ssh_brute_force, fail2ban_ban, fail2ban_alert, apparmor_denied, db_auth_failure, auth_failure, http_forbidden, access_denied. Unified from `security_events` + `log_entries` (fail2ban, kernel, auth sources). Filter badges per event type.
+
+**Top errors table** (7 columns): Source, Level, Message (sample), Total occurrences, Last 6h count, Trend (rising/falling/stable vs prior 6h), Last seen. Aggregated from `log_entries` by fingerprint. Dual filter badges: source + level.
+
+**Log filters** — two groups: Level (error/warn/info/debug) + Source (per source). Toggleable badges with counts.
+
+**Recent log entries table** (5 columns): Time, Level, Source, Component, Message. Up to 500 entries balanced per source (50 per source cap). Row-expandable for full context. Filterable by level + source. Searchable via MonTables.
+
+**Error patterns table** (7 columns): Source, Level, Pattern (normalized), Count, First seen, Last seen, Status (active/resolved). Filter badges per status + level.
+
+### Tab 7: Alerts
+
+**Active alerts table** (4 columns): Time, Type (critical/warning/info), Component (system/api/db/proxy), Message. Color-coded rows by severity. Filter badges per alert_type. Up to 20 active alerts.
+
+**Heartbeat history table** (3 columns): Time, Component, Status. Green rows for ok, red for failures. Filter badges per component. Last 50 heartbeats.
+
+### Tab 8: Insights
+
+**SLO status** (4 radial gauges with verdicts):
+
+| SLO | Gauge ID | Target | Scale | Thresholds |
+|-----|----------|--------|-------|------------|
+| API Uptime | `gauge-slo-uptime` | 99.9% | 0-100% | Red <99.5%, Orange 99.5-99.9%, Green >99.9% |
+| p95 Latency | `gauge-slo-latency` | 500ms | 0-500ms | Green <300ms, Orange 300-450ms, Red >450ms |
+| p99 Latency | `gauge-slo-p99` | 2000ms | 0-2000ms | Green <1200ms, Orange 1200-1800ms, Red >1800ms |
+| DB Cache Hit | `gauge-slo-cache` | 99% | 0-100% | Red <95%, Orange 95-99%, Green >99% |
+
+Each gauge has:
+- Verdict below: status line (BREACHED / RECOVERING / WARNING / Within SLO)
+- Detail line: violations/periods count, budget % used, last computation time
+- Action line: specific remediation advice when not ok
+- **24h sparkline**: trend canvas showing hourly actual_value history (green if meeting SLO, red if breaching)
+- Override coloring: gauge turns solid red when breaching, orange when recovering/warning
+
+**Insight summary row**: All badge (total count) + By Severity (critical=red, warning=yellow, info=gray) + By Type (drift, anomaly, correlation, log-metric, slo badges). All badges are clickable filters.
+
+**Active insights table** (10 columns): Time, Type, Severity, Domain, Metric, Current value, Baseline mean, Z-Score, Drift %, Message. Filtered by badge selection. Row accents: `correlation` rows get cyan left border, `log_metric_correlation` rows get purple left border. Severity cell color-coded.
+
+**Recommendations table** (4 columns): Category, Severity, Target, Recommendation (title + description). SQL action rows shown below applicable recommendations. Filter badges: severity (critical/warn/info) + category (vacuum/process/index/performance/system/api/proxy/db/logs/security). Color-coded rows by severity.
+
+**Baselines table** (8 columns): Domain, Metric (with metric_key suffix), Mean, StdDev, p5, p50, p95, Samples. Filter badges per domain. 7-day window.
+
+### Tab 9: Replication
+
+**Summary cards** (4): Replica count, Max replay lag (warn >100ms, error >1s), Max flush lag (warn >100ms, error >1s), WAL status (aggregated across slots).
+
+**Slots table** (9 columns): Slot name, Type (physical/logical), Active (Yes=green, No=red), Client IP, State, WAL status, Replay lag, Flush lag, Write lag. Lag columns color-coded: green <100ms, yellow 100ms-1s, red >=1s.
+
+**Empty state**: "No replication slots configured (standalone server)" — displayed on standalone servers with no replication.
+
+**Tab badge**: Warns (yellow) if any slot has replay_lag >1s.
+
+### Tab Badge Logic
+
+| Tab | Badge Shows | Trigger |
+|-----|-------------|---------|
+| System | Issue count | CPU >=80%, memory >=85%, any disk >=85% |
+| Processes | Issue count | Via process severity scoring (CPU/RSS/FD/thread/state thresholds) |
+| API & Proxy | Issue count | Failed requests + proxy client/server errors + low cache hit |
+| PostgreSQL | Issue count | Deadlocks, waiting locks, slow queries, waiting connections, low cache, high rollback ratio, backend fsyncs |
+| Tables & Indexes | Issue count | Tables with dead/live >10% and >100 live rows |
+| Queries | Issue count | Queries with mean >500ms or max >2000ms |
+| Logs | Error count | Error-level entries in last 1 hour |
+| Alerts | Alert count | Active unresolved alerts |
+| Insights | Insight count | Color: red if critical, yellow if warn, gray if info only |
+| Replication | Issue count | Slots with replay_lag >1000ms |
+
+### Color-Coding Reference
+
+| Context | Metric | Warn | Error |
+|---------|--------|------|-------|
+| System | CPU | 70% | 80-90% |
+| System | Memory | 75-80% | 85-95% |
+| System | Swap | 50% | 80% |
+| System | Disk | 75% | 85% |
+| API | Error rate | 1% | 5% |
+| API | Failed requests | >0 | >10 |
+| API | DB response time | 50ms | 100ms |
+| API | DB cache hit | <99% | <95% |
+| Proxy | p50 latency | 200ms | 500ms |
+| Proxy | p95 latency | 500ms | 1000ms |
+| Proxy | p99 latency | 1000ms | 2000ms |
+| Proxy | Handshake failures | >0 | >10 |
+| PostgreSQL | Waiting connections | >0 | >5 |
+| PostgreSQL | Deadlocks | — | >0 |
+| PostgreSQL | Slow queries | >0 | >5 |
+| Queries | Mean exec time | 500ms | 1000ms |
+| Queries | Max exec time | 2000ms | 5000ms |
+| Queries | Temp blocks | >0 (any spill) | >1000 |
+| Replication | Any lag | 100ms | 1000ms |
+| Insights | Correlation rows | cyan left border (metric) | purple left border (log-metric) |
+
+### API Backend
+
+`api.php` serves JSON for dashboard auto-refresh:
+
+| Mode | Endpoint | Queries | Description |
+|------|----------|---------|-------------|
+| `full` | `api.php` | 23 | System latest+history, processes, API latest+history, proxy, DB latest+history, tables, indexes, statements, IO, replication, heartbeat, alerts, alert_count, insights, recommendations, baselines, SLOs, insight_summary, log_summary |
+| `badges` | `api.php?mode=badges` | 3 | Heartbeat, alert count, API uptime only |
+| `logs` | `api.php?mode=logs` | 11 | Entries (balanced 50/source, 500 max), level/source counts, error_by_source, patterns, hourly_volume, total count, source_health (24h+trend), error_rate_trend, security_events (unified), top_errors (6h trend), current_error_rate, log_baselines |
+| `api_errors` | `api.php?mode=api_errors` | 1 | HTTP fetch from API server `127.0.0.1:3003/metrics/errors` |
+| `proxy_errors` | `api.php?mode=proxy_errors` | 1 | HTTP fetch from proxy admin `127.0.0.1:8082/metrics/errors` |
+
+### Refresh Architecture
+
+| Timer | Interval | Scope |
+|-------|----------|-------|
+| Full refresh | 10s | All 23 data sources, re-render active tab |
+| Badge poll | 5s | Heartbeat + alert count + uptime (3 lightweight queries) |
+| Ticker | 1s | Heartbeat age, updated age, uptime interpolation (no DB queries) |
+
+### Chart Types (from `monitor-charts.js`)
+
+| Type | Function | Usage |
+|------|----------|-------|
+| `sparkline()` | Area+line mini chart | Quick stat cards, SLO trend |
+| `lineChart()` | Multi-series time-series | CPU, memory, load, network, RPS, latency, transactions, error rate |
+| `barChart()` | Horizontal bars | Disk usage |
+| `stackedBar()` | Stacked horizontal bars | I/O by backend type |
+| `gauge()` | Radial gauge | Cache hit ratio, error rate, SLO gauges |
+| `pieChart()` | Pie/donut | Wait events, errors by source |
+
+### Interactive Elements
+
+- **Clickable cards**: Failed requests (scrolls to error table), proxy client/server errors (loads error drilldown), log error/warn counts
+- **Filter badges**: Clickable toggle filters on alerts, heartbeats, security events, top errors, log patterns, recommendations, baselines, proxy errors, API errors, insights (severity + type)
+- **Process filters**: 7 toggle buttons with real-time badge count updates
+- **Tab persistence**: Active tab saved to `localStorage`
+- **Keyboard navigation**: Arrow keys, Home/End, Enter/Space on tab bar
+- **Tooltip system**: Global floating tooltip triggered by `data-tip` attributes on cards, table headers, and rows. Auto-positions below target, flips above if off-screen, clamps horizontal edges.
+- **MonTables enhancement**: Search, sort, and pagination on process, query, I/O detail, alert, heartbeat, insight, recommendation, baseline, replication, and log tables
+
 ## Resource Usage
 
 The collector is designed to be lightweight despite 10s collection intervals:
