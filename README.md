@@ -50,7 +50,7 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 | `config_tick` | 60s | Config file hot-reload (mtime-based change detection) |
 | `pg_extended_tick` | 5min | Per-table, per-index, IO, replication, statement stats |
 | `intel_tick` | 5min | Anomaly detection, recommendations, health scores, capacity predictions, log pattern analysis, error spike detection, security event detection |
-| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup, stale cardinality pruning, fingerprint budget reset |
+| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup, stale cardinality pruning, fingerprint budget reset. First tick is consumed at startup (no-op); a one-shot 3-minute delayed startup runs aggregation + baselines + SLOs once data has accumulated. |
 
 The fast-path ticks (sys, app, heartbeat) are designed for negligible resource impact:
 - `sysinfo` reads from `/proc` (kernel shared memory, no disk I/O)
