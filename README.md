@@ -722,7 +722,7 @@ Each gauge has:
 - **Process filters**: 7 toggle buttons with real-time badge count updates
 - **Tab persistence**: Active tab saved to `localStorage`
 - **Keyboard navigation**: Arrow keys, Home/End, Enter/Space on tab bar
-- **Tooltip system**: Global floating tooltip triggered by `data-tip` attributes on cards, table headers, and rows. Auto-positions below target, flips above if off-screen, clamps horizontal edges.
+- **Tooltip system**: Global floating tooltip triggered by `data-tip` attributes on cards, table headers, and rows. Auto-positions below target, flips above if off-screen, clamps horizontal edges. Every value card tooltip includes its time range: "Latest 10-second sample" (system gauges), "Point-in-time snapshot" (DB connections, locks), "Cumulative since API/proxy/database start" (counters), "5-minute sliding window" (proxy latency percentiles), "24h/6h/1h window" (log metrics), "7-day rolling" (baselines), or "30-day sliding window" (SLO budgets).
 - **MonTables enhancement**: Search, sort, and pagination on process, query, I/O detail, alert, heartbeat, insight, recommendation, baseline, replication, and log tables
 
 ## Resource Usage
