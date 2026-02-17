@@ -187,7 +187,7 @@ Computes error budget as `violations / allowed_violations * 100`. Generates `slo
 | process | {name} | FDs > 500 (info), > 1000 (warn) | info/warn |
 | process | {name} | Crashed/stopped | critical |
 | process | {name} | Recently restarted (uptime < 5 min, known services) | warn |
-| index | unused:{name} | Unused indexes > 1MB (excludes `_pkey`, `_key`, constraint types `p`/`u`) | info |
+| index | unused:{name} | Unused indexes > 1MB (excludes `_pkey`, `_key`, `_unique`, constraint types `p`/`u`) | info |
 | logs | {source} | Recurring error/warn patterns (>10 occurrences/hour) | info/warn |
 | security | {event_type} | Security events detected | warn |
 
