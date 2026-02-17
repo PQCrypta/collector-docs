@@ -17,12 +17,12 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
          │            │      │        │         │        │
          ▼            ▼      ▼        ▼         ▼        ▼
    ┌──────────┐ ┌────────┐ ┌─────┐ ┌────────┐ ┌──────┐ ┌─────────┐
-   │  sysinfo  │ │HTTP+PG │ │logs │ │baselines│ │rollups│ │staleness│
-   │  /proc    │ │scrape  │ │files│ │anomalies│ │retain │ │health   │
-   └─────┬────┘ └────┬───┘ │jrnl │ │SLOs     │ │log agg│ └────┬────┘
-         │           │     └──┬──┘ │recs     │ └───┬──┘      │
-         │           │        │    │log anlys│     │          │
-         ▼           ▼        ▼    └────┬───┘     ▼          ▼
+   │  sysinfo  │ │HTTP+PG │ │logs │ │anomalies│ │rollups│ │staleness│
+   │  /proc    │ │scrape  │ │files│ │SLOs     │ │retain │ │health   │
+   └─────┬────┘ └────┬───┘ │jrnl │ │recs     │ │baselin│ └────┬────┘
+         │           │     └──┬──┘ │log anlys│ │SLO    │      │
+         │           │        │    └────┬───┘ │log agg│      │
+         ▼           ▼        ▼         ▼     └───┬──┘      ▼
    ┌──────────────────────────────────────────────────────────────┐
    │              MetricWriter + LogIngester (batched)             │
    │  10 metric buffers + log batch INSERT on flush                │
@@ -45,8 +45,8 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 | `watchdog_tick` | 30s | Staleness detection, table health, process health, API error rate, DB response time, long queries, connection trend, IO pressure |
 | `config_tick` | 60s | Config file hot-reload (mtime-based change detection) |
 | `pg_extended_tick` | 5min | Per-table, per-index, IO, replication, statement stats |
-| `intel_tick` | 5min | Intelligence layer: baselines, anomaly detection, SLO computation, recommendations, log pattern analysis, error spike detection, security event detection |
-| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 7d, hourly 90d, daily 2yr), baseline recomputation, SLO computation, log metric aggregation, log data cleanup |
+| `intel_tick` | 5min | Anomaly detection, recommendations, log pattern analysis, error spike detection, security event detection |
+| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup |
 
 The fast-path ticks (sys, app, heartbeat) are designed for negligible resource impact:
 - `sysinfo` reads from `/proc` (kernel shared memory, no disk I/O)
@@ -58,13 +58,13 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 ### `src/metrics/`
 
-**`system.rs`** — Collects host-level metrics via `sysinfo` crate: CPU usage per-core and aggregate, memory (total/used/available/swap), load averages (1/5/15 min), disk usage and IO per mount, network bytes/packets per interface.
+**`system.rs`** — Collects host-level metrics via `sysinfo` crate: CPU usage aggregate (user and system report total average — sysinfo does not split user/system), memory (total/used/available/swap), load averages (1/5/15 min), disk usage per mount (total/available/usage_pct stored as JSONB), network bytes per interface.
 
-**`process.rs`** — Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Tracks CPU percentage (delta-based calculation between samples), RSS bytes, file descriptor count, thread count, and process state. Filters to a configurable list of watched process names.
+**`process.rs`** — Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Tracks CPU percentage (delta-based calculation between samples), RSS bytes, VSZ bytes, file descriptor count, thread count, and process state. Filters to a configurable list of watched process names plus the top 25 non-target processes by RSS to catch resource hogs.
 
 **`app.rs`** — Application-level metric collection with two strategies:
-- **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics`) endpoints. Parses `ApiMetrics` (request counts, latency percentiles, error rates, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles).
-- **Direct PG queries**: Executes against `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_statio_user_tables`, `pg_stat_replication`, `pg_stat_statements`, `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_activity` (wait events/locks). Collects 6 tiers of database metrics: connection pool stats, per-table stats (live/dead tuples, seq/idx scans, modifications), per-index stats (scans, reads, fetches, bloat), IO stats (heap/index/toast block reads/hits), replication lag, and statement-level stats (calls, total/mean time, rows).
+- **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics/json`) endpoints. Parses `ApiMetrics` (request counts, latency percentiles, error rates, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles).
+- **Direct PG queries**: Executes against `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_stat_io` (PG16+), `pg_stat_replication`, `pg_stat_statements`, `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_activity` (wait events/locks). Collects 6 tiers of database metrics: connection pool stats, per-table stats (live/dead tuples, seq/idx scans, modifications), per-index stats (scans, reads, fetches, size), per-backend-type IO stats (reads, writes, hits, evictions, fsyncs with timing), replication lag, and statement-level stats (calls, total/mean time, rows).
 
 ### `src/db/`
 
@@ -77,14 +77,14 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
   - **Cumulative counter handling**: API metrics `total_requests` and `failed_requests` are cumulative counters — the hourly rollup uses `GREATEST(max(col) - min(col), 0)` to compute per-hour deltas instead of `sum()`, which would produce inflated counts from cumulative snapshots.
   - **DB response time**: Includes `avg(db_response_ms)` in the API hourly rollup for baseline tracking.
 - **Daily rollups**: Aggregates hourly rows from the past day into `*_daily` tables.
-- **Retention cleanup**: Deletes raw data older than 7 days, hourly data older than 90 days, daily data older than 2 years.
+- **Retention cleanup**: Deletes raw data older than configured days (default 14), hourly data older than configured days (default 90), daily data older than configured days (default 365).
 - **Consolidated cleanup** (hourly): Removes heartbeats older than 24 hours, resolved alerts older than 7 days, resolved insights older than 7 days. Moved from the 30s watchdog tick to reduce unnecessary frequency.
 
 ### `src/intelligence.rs`
 
-Statistical intelligence engine that runs every 5 minutes:
+Statistical intelligence engine with `Severity` enum (`Info`, `Warn`, `Critical`) for type-safe alert classification:
 
-**Baselines** — Computes 7-day and 30-day rolling mean and stddev for 24 global metrics across 5 domains plus dynamic per-table `dead_tup_ratio`. Stores in `collector.baselines` with `ON CONFLICT` upsert. Requires minimum 6 samples before establishing a baseline.
+**Baselines** (runs on `agg_tick`, hourly) — Computes 7-day and 30-day rolling mean, stddev, and percentiles (p5/p25/p50/p75/p95) for 25 global metrics across 5 domains plus dynamic per-table `dead_tup_ratio`. Stores in `collector.baselines` with `ON CONFLICT` upsert. Requires minimum 6 samples before establishing a baseline. Skips NULL, NaN, and Inf values to prevent pollution from incomplete data windows.
 
 | Domain | Metrics |
 |--------|---------|
@@ -95,26 +95,28 @@ Statistical intelligence engine that runs every 5 minutes:
 | logs | `error_count`, `warn_count`, `total_count`, `error_rate_pct` |
 | table (dynamic) | `dead_tup_ratio` per table (computed separately for each table with sufficient history) |
 
-**Anomaly detection** — For each baselined metric, fetches the latest raw value and computes:
+**Anomaly detection** (runs on `intel_tick`, every 5 min) — For each baselined metric, fetches the latest raw value and computes:
 - Z-score: `(value - mean) / stddev`
 - Drift percentage: `(value - mean) / mean * 100`
-- Severity: `critical` if |z| > 3, `warn` if |z| > 2, `info` otherwise
+- Severity: `critical` if |z| >= 4 or |drift| >= 300%, `warn` if |z| >= 3 or |drift| >= 200%, `info` if |z| >= 2 or |drift| >= 100%
 - Direction: `spike` or `drop` based on sign
+- Warn and critical anomalies require 2+ consecutive detection cycles before being recorded (transient spike suppression)
 
-Includes per-table anomaly detection for dead tuple ratio baselines. Deduplicates insights within 60 minutes.
+Includes per-table anomaly detection for dead tuple ratio baselines. Deduplicates insights within 30 minutes.
 
 **Lower-is-better suppression** — For metrics where a decrease is an improvement (not an anomaly), large negative drifts (>50%) are suppressed:
 - `logs/error_count`, `logs/warn_count`, `logs/error_rate_pct`
-- `db/slow_queries`, `db/deadlocks`
+- `db/slow_queries`, `db/deadlocks`, `db/waiting_conn`
 - `proxy/request_server_errors`, `proxy/handshake_failures`, `proxy/rl_requests_blocked`
 - `table/dead_tup_ratio` (a drop means vacuum worked)
 
 **Cross-domain correlation** — When 2+ anomalies from different domains co-occur in the same detection cycle, a `correlation` insight is generated linking them (e.g., API latency spike + DB cache drop + proxy error increase noted as a single correlated event). Rate-limited to one correlation insight per 30 minutes.
 
-**SLO tracking** — Three SLOs with 30-day sliding window:
-- `api_uptime`: Target 99.9% — counts periods where error rate exceeds 1%
-- `api_latency_p95`: Target 200ms — counts periods where p95 > target
-- `db_cache_hit`: Target 99% — counts periods where cache hit ratio < target
+**SLO tracking** (runs on `agg_tick`, hourly) — Four SLOs with 30-day sliding window:
+- `api_uptime`: Target 99.9% — counts periods where `(total - failed) / total` falls below 99.9%
+- `api_latency_p95`: Target 500ms — counts periods where p95 > 500ms
+- `api_latency_p99`: Target 2000ms — counts periods where p99 > 2000ms (99% reliability target)
+- `db_cache_hit`: Target 99% — counts periods where cache hit ratio < 99%
 
 Computes error budget as `violations / allowed_violations * 100`. Generates `slo_violation` insights when SLOs are not met. Skipped for the first 10 minutes after collector restart to avoid counting the deployment gap as a violation.
 
@@ -145,17 +147,18 @@ Computes error budget as `violations / allowed_violations * 100`. Generates `slo
 | db | waiting | Waiting connections > 5 | warn |
 | db | checkpoint | Backend fsyncs > 0 | warn |
 | db | wal | WAL bytes > 100MB | info |
-| db | replication:{slot} | Replication lag > 10s (warn), > 30s (crit) | warn/critical |
+| db | replication:{slot} | Replication lag > 1s (warn), > 30s (crit) | warn/critical |
+| db | query:{id} | Avg exec time > 500ms (info), > 2000ms (warn) | info/warn |
+| db | temp:{id} | Temp blocks spilled > 10000 | info |
 | performance | io_read | Avg disk read latency > 50ms | warn |
 | performance | io_write | Avg disk write latency > 50ms | warn |
-| performance | {table} | High update churn | warn |
+| performance | {table} | High update churn (updates/live > 2.0) | info |
 | process | {name} | Memory > 500MB (warn), > 1GB (crit) | warn/critical |
 | process | {name} | CPU > 30% (warn), > 80% (crit) | warn/critical |
 | process | {name} | FDs > 500 (info), > 1000 (warn) | info/warn |
 | process | {name} | Crashed/stopped | critical |
-| index | unused:{name} | Unused indexes > 10MB (excludes primary keys) | info |
-| query | query:{id} | Avg > 500ms (info), > 2000ms (warn) | info/warn |
-| query | temp:{id} | Temp blocks spilled > 10000 | info |
+| process | {name} | Recently restarted (uptime < 5 min, known services) | warn |
+| index | unused:{name} | Unused indexes > 1MB (excludes primary keys) | info |
 | security | {event_type} | Security events detected | warn |
 
 ### `src/log_ingest.rs`
@@ -180,7 +183,7 @@ Streaming log ingestion engine that polls 13 sources every 15 seconds:
 | `kernel` | file | `/var/log/kern.log` | syslog |
 | `certbot` | file | `/var/log/letsencrypt/letsencrypt.log` | certbot |
 
-**File ingestion** — Tracks byte offset and inode per source in `log_positions`. On each tick: checks inode for log rotation (reset offset if changed or file shrank), reads up to 64KB from saved offset, parses complete lines only, batch INSERTs with multi-row VALUES.
+**File ingestion** — Tracks byte offset, inode, and last file size per source in `log_positions`. On each tick: checks for log rotation via inode change, file shrinkage below offset, or file shrinkage below last known size (handles copytruncate). Reads up to 64KB from saved offset, parses complete lines only, batch INSERTs with multi-row VALUES. Messages longer than 4096 characters are truncated.
 
 **Journal ingestion** — Runs `journalctl -u UNIT -o json --after-cursor=X -n N` as an async subprocess. Handles MESSAGE fields that arrive as byte arrays (ANSI-encoded output from Rust tracing). Strips ANSI escape sequences and extracts level/component from tracing format. First run limits to 100 lines to avoid massive backfill.
 
@@ -199,9 +202,9 @@ Streaming log ingestion engine that polls 13 sources every 15 seconds:
 
 Log-specific analysis that runs on `intel_tick` (every 5 minutes), feeding into the existing insights, recommendations, and alerts tables:
 
-**Pattern detection** — Upserts `log_patterns` from entries in the last 5 minutes, grouped by fingerprint, source, and level. Auto-resolves patterns not seen in 1 hour.
+**Pattern detection** — Upserts `log_patterns` from error/warn entries in the last 1 hour, grouped by fingerprint, source, and level, requiring at least 2 occurrences. Auto-resolves patterns not seen in 1 hour.
 
-**Error spike detection** — Compares 5-minute error count against the hourly baseline from `log_metrics_hourly`. If error count exceeds 3x the baseline average, inserts an `error_spike` insight (domain=`logs`).
+**Error spike detection** — Compares 5-minute error/warn count against the 7-day statistical baseline from `collector.baselines` (falling back to 24h average from `log_metrics_hourly`). Scales baseline to 5-minute window (baseline/12). Requires at least 5 error/warn entries in the 5-minute window. Inserts an `error_spike` insight (domain=`logs`) if count exceeds 3x the expected rate.
 
 **Security event detection:**
 - SSH brute force: >5 failed logins from same IP in 5 minutes -> alert (type=`ssh_brute_force`)
@@ -211,9 +214,13 @@ Log-specific analysis that runs on `intel_tick` (every 5 minutes), feeding into 
 **Actionable recommendations** — Context-aware pattern matching generates specific remediation steps:
 - SSH brute force -> numbered steps: check attacking IPs, block with `ufw`, verify fail2ban, disable password auth
 - PostgreSQL connection errors -> check API server, verify `pg_hba.conf`, test connectivity
+- PostgreSQL "relation does not exist" -> check migration status, verify table names
 - Deadlock detection -> review transaction ordering, check long-running queries
 - Permission denied errors -> check file ownership, verify service user permissions
 - Disk/IO errors -> check filesystem health, review SMART status
+- Connection/timeout errors -> check service connectivity, verify network
+- Collector crash loop detection -> check logs and configuration
+- NOUSER shadow lookup errors -> check user/group configuration
 - Recurring error patterns (>10 occurrences/hour) -> source-specific recommendations with diagnostic commands
 
 **Cross-domain log correlation** — Detects when log error spikes coincide with metric anomalies (e.g., API error spike in logs at the same time as latency anomaly in metrics).
@@ -237,11 +244,11 @@ All watchdog alerts use deduplication (matching alert type + subject prefix) and
 
 ### `src/config.rs`
 
-TOML configuration with environment variable overrides. Default path: `/etc/pqcrypta/collector.toml`. Supports hot-reload: every 60 seconds the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout, intervals, retention days) without restart. DB credentials require a full restart.
+TOML configuration with environment variable overrides. Default path: `/etc/pqcrypta/collector.toml` (override via `COLLECTOR_CONFIG` env var). Supports hot-reload: every 60 seconds the collector checks the config file mtime and reloads safe fields (batch_size, query_timeout_secs, system_secs, app_secs, raw_days, hourly_days, daily_days) without restart. DB credentials, heartbeat interval, processes, scrape URLs, and log config require a full restart.
 
 ```toml
 [database]
-host = "127.0.0.1"       # env: DB_HOST
+host = "localhost"        # env: DB_HOST
 port = 5432               # env: DB_PORT
 name = "pqcrypta"         # env: DB_NAME
 user = "pqcrypta_user"    # env: DB_USER
@@ -253,18 +260,18 @@ app_secs = 10             # env: APP_INTERVAL_SECS
 heartbeat_secs = 5        # env: HEARTBEAT_INTERVAL_SECS
 
 [scrape]
-api_metrics_url = "http://127.0.0.1:3003/metrics"
-proxy_metrics_url = "http://127.0.0.1:8082/metrics/json"
+api_metrics_url = "http://127.0.0.1:3003/metrics"      # env: API_METRICS_URL
+proxy_metrics_url = "http://127.0.0.1:8082/metrics/json"  # env: PROXY_METRICS_URL
 
 [retention]
-raw_days = 14
-hourly_days = 90
-daily_days = 365
+raw_days = 14             # env: RAW_RETENTION_DAYS
+hourly_days = 90          # env: HOURLY_RETENTION_DAYS
+daily_days = 365          # env: DAILY_RETENTION_DAYS
 
 [collector]
-batch_size = 50
-query_timeout_secs = 10  # env: QUERY_TIMEOUT_SECS — per-query timeout to prevent stuck queries blocking the event loop
-processes = ["pqcrypta-api", "pqcrypta-proxy", "pqcrypta-collector", "postgres", "apache2", "php-fpm"]
+batch_size = 50           # env: BATCH_SIZE
+query_timeout_secs = 10   # env: QUERY_TIMEOUT_SECS — per-query timeout to prevent stuck queries blocking the event loop
+processes = ["pqcrypta-proxy", "pqcrypta-api", "pqcrypta-collector", "postgres", "apache2", "php-fpm"]
 
 [logs]
 enabled = true                # env: LOG_ENABLED
@@ -279,11 +286,11 @@ chunk_size = 65536            # bytes to read per file source
 Five migration files in `migrations/`:
 
 **001_collector_schema.sql** — Core tables:
-- `collector.system_metrics_raw` — Host CPU, memory, load, disk, network (14 columns)
-- `collector.process_metrics_raw` — Per-process CPU, RSS, FDs, threads, state, uptime (10 columns)
-- `collector.api_metrics_raw` — API request counts, latency percentiles, errors, cache stats, DB response time (17 columns)
-- `collector.proxy_metrics_raw` — Proxy connections, TLS stats, rate limiting, upstream latency (24 columns)
-- `collector.db_metrics_raw` — PostgreSQL connection pool, transaction counts, cache ratios, slow queries (14 columns)
+- `collector.system_metrics_raw` — Host CPU, memory, load, swap, network, disk JSONB (15 columns)
+- `collector.process_metrics_raw` — Per-process CPU, RSS, VSZ, FDs, threads, state, uptime (10 columns)
+- `collector.api_metrics_raw` — API request counts, latency percentiles, errors, cache stats, DB response time (20 columns)
+- `collector.proxy_metrics_raw` — Proxy connections, TLS stats, rate limiting, upstream latency (28 columns)
+- `collector.db_metrics_raw` — PostgreSQL connection pool, transaction counts, cache ratios, slow queries (16 base columns)
 - `collector.heartbeat` — Collector liveness tracking
 - `collector.alerts` — Alert storage with deduplication and resolution tracking
 - `collector.system_metrics_hourly` — Hourly system aggregates (CPU, load, memory, network)
@@ -293,18 +300,18 @@ Five migration files in `migrations/`:
 - `collector.system_metrics_daily` — Daily system aggregates
 
 **002_extended_pg_metrics.sql** — Extended PostgreSQL monitoring:
-- Adds bgwriter, WAL, wait event, and lock columns to `db_metrics_raw`
+- Adds bgwriter (9 cols), WAL (8 cols), wait event (9 cols), and lock (9 cols) columns to `db_metrics_raw` (51 total columns)
 - `collector.table_metrics_raw` — Per-table live/dead tuples, seq/idx scans, modifications, autovacuum timing
-- `collector.index_metrics_raw` — Per-index scans, reads, fetches, size, bloat
-- `collector.io_metrics_raw` — Per-table heap/index/toast block reads and hits
+- `collector.index_metrics_raw` — Per-index scans, reads, fetches, size
+- `collector.io_metrics_raw` — Per-backend-type IO statistics from `pg_stat_io` (PG16+): reads, writes, hits, evictions, fsyncs with timing
 - `collector.replication_metrics_raw` — Replication state, write/flush/replay lag, sent/write/flush/replay LSN
 - `collector.statement_metrics_raw` — Top N statements by total time (calls, rows, mean/total time, shared block stats)
-- Corresponding hourly aggregate tables for table, IO, and statement metrics
+- Corresponding hourly aggregate tables for table and IO metrics
 
 **003_intelligence_schema.sql** — Intelligence layer:
-- `collector.baselines` — Statistical baselines (domain, metric, metric_key, time_window, mean, stddev, min, max, sample_count)
-- `collector.insights` — Detected anomalies, drift events, correlations, SLO violations (type, severity, domain, metric, z_score, drift_pct, direction)
-- `collector.recommendations` — Actionable recommendations (category, severity, target, title, description, action, acknowledged)
+- `collector.baselines` — Statistical baselines (domain, metric, metric_key, time_window, mean, stddev, p5, p25, p50, p75, p95, sample_count, updated_at)
+- `collector.insights` — Detected anomalies, drift events, correlations, SLO violations (insight_type, severity, domain, metric, metric_key, current_value, baseline_mean, baseline_stddev, z_score, drift_pct, message, resolved, expires_at)
+- `collector.recommendations` — Actionable recommendations (category, severity, target, title, description, action_sql, acknowledged, expires_at)
 - `collector.slo_tracking` — SLO computation results (slo_name, target, actual, met, budget_consumed, violations, total_periods)
 
 **004_log_tables.sql** — Log ingestion and analysis:
@@ -329,29 +336,39 @@ All tables use `ts TIMESTAMPTZ` as the primary time column with descending index
 A service unit is provided in `pqcrypta-collector.service`:
 
 ```ini
+[Unit]
+Description=PQCrypta Metrics Collector
+After=postgresql.service pqcrypta-api.service
+Wants=postgresql.service
+
 [Service]
-ExecStart=/usr/local/bin/pqcrypta-collector
-Restart=always
-RestartSec=5
+Type=simple
+ExecStart=/var/www/html/public/ent/target/release/pqcrypta-collector
+Restart=on-failure
+RestartSec=10
 MemoryMax=64M
 CPUQuota=5%
-Environment=RUST_LOG=info
+Environment=RUST_LOG=pqcrypta_collector=info
 Environment=COLLECTOR_CONFIG=/etc/pqcrypta/collector.toml
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ### Build
 
 ```bash
 cargo build --release
-cp target/release/pqcrypta-collector /usr/local/bin/
 ```
+
+The service file runs the binary from `target/release/` directly. Alternatively, copy to a system path and update `ExecStart`.
 
 ### Prerequisites
 
 - PostgreSQL 15+ with the `collector` schema created
 - Run migrations in order: `001_collector_schema.sql`, `002_extended_pg_metrics.sql`, `003_intelligence_schema.sql`, `004_log_tables.sql`, `005_log_enhancements.sql`
 - API server running on port 3003 with `/metrics` endpoint
-- Proxy server running on port 8082 with `/metrics` endpoint (optional)
+- Proxy server running on port 8082 with `/metrics/json` endpoint (optional)
 - Read access to log files in `/var/log/` (auth.log, kern.log, postgresql, apache2, fail2ban, letsencrypt, pqcrypta-proxy)
 - `journalctl` available for systemd journal sources (pqcrypta-api, pqcrypta-proxy, pqcrypta-collector)
 
