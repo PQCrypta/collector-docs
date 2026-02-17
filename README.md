@@ -39,7 +39,7 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 
 | Tick | Interval | Responsibility |
 |------|----------|----------------|
-| `sys_tick` | 10s | CPU (direct `/proc/stat` delta), memory, load, disk, network via `sysinfo` |
+| `sys_tick` | 10s | CPU (direct `/proc/stat` delta), memory, load, disk, network via `sysinfo`. Also emits self-monitoring metrics (buffer depths, flush/spill counts, tick duration, rows written) to `collector_self_metrics`. |
 | `app_tick` | 10s | API metrics (HTTP scrape port 3003), proxy metrics (HTTP scrape port 8082), DB stats (direct pg_stat queries) |
 | `heartbeat_tick` | 5s | Lightweight liveness heartbeat (single INSERT) |
 | `log_tick` | 15s | Log ingestion from 13 file and journal sources, batch INSERT into `log_entries` |
@@ -70,9 +70,9 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 ### `src/db/`
 
-**`writer.rs`** — `MetricWriter` with 10 typed `VecDeque` ring buffers (system, process, API, proxy, DB, table, index, IO, replication, statement) and a disk-backed spill queue. Each `push_*` method appends to the buffer; when a buffer reaches `max_capacity` (batch_size × 20), the oldest entry is serialized to the disk queue instead of being dropped. `flush()` wraps all INSERTs in a `BEGIN`/`COMMIT` transaction with per-query timeout protection; after successful commit, any spilled records are drained from disk and flushed in batches. On any error, `ROLLBACK` is executed and buffers are restored. `spill_all_to_disk()` drains all 10 in-memory buffers to disk at shutdown when DB is unhealthy. `drain_all_spilled()` recovers spilled data from a previous run on startup.
+**`writer.rs`** — `MetricWriter` with 10 typed `VecDeque` ring buffers (system, process, API, proxy, DB, table, index, IO, replication, statement) and a disk-backed spill queue. Each `push_*` method appends to the buffer; when a buffer reaches `max_capacity` (batch_size × 20), the oldest entry is serialized to the disk queue instead of being dropped. `flush()` wraps all INSERTs in a `BEGIN`/`COMMIT` transaction with per-query timeout protection; after successful commit, any spilled records are drained from disk and flushed in batches. On any error, `ROLLBACK` is executed and buffers are restored. `spill_all_to_disk()` drains all 10 in-memory buffers to disk at shutdown when DB is unhealthy. `drain_all_spilled()` recovers spilled data from a previous run on startup. Tracks `flush_count` and `total_rows_written` counters for self-monitoring, exposed along with `buffer_depths()` (per-buffer row counts) and `disk_queue_bytes()` for the dashboard Collector tab.
 
-**`disk_queue.rs`** — Disk-backed durable queue for metric spill during DB outages. Uses a single append-only JSONL file (`queue.jsonl`) with tagged serde (`SpilledRecord` enum covering all 10 metric types). `spill()` appends a JSON line with disk budget enforcement (default 100MB). `drain(batch_size)` reads records from the front and atomically rewrites the remainder via temp file + rename. Configurable via `queue_dir` (default `/var/lib/pqcrypta-collector/queue`) and `queue_max_mb` (default 100).
+**`disk_queue.rs`** — Disk-backed durable queue for metric spill during DB outages. Uses a single append-only JSONL file (`queue.jsonl`) with tagged serde (`SpilledRecord` enum covering all 10 metric types). `spill()` appends a JSON line with disk budget enforcement (default 100MB). `drain(batch_size)` reads records from the front and atomically rewrites the remainder via temp file + rename. `current_bytes()` exposes queue size for self-monitoring. Configurable via `queue_dir` (default `/var/lib/pqcrypta-collector/queue`) and `queue_max_mb` (default 100).
 
 **`helpers.rs`** — `timed_execute()` wraps `client.execute()` with a `tokio::time::timeout` to prevent stuck queries from blocking the event loop indefinitely.
 
@@ -313,7 +313,7 @@ chunk_size = 65536            # bytes to read per file source
 
 ## Database Schema
 
-Six migration files in `migrations/`:
+Seven migration files in `migrations/`:
 
 **001_collector_schema.sql** — Core tables:
 - `collector.system_metrics_raw` — Host CPU, memory, load, swap, network, disk JSONB (15 columns)
@@ -366,6 +366,9 @@ Six migration files in `migrations/`:
 - `collector.capacity_alerts` — Predictive threshold breach alerts (domain, metric, current_value, predicted_value, threshold, hours_until, confidence, message)
 - `collector.health_scores` — Per-domain composite health scores (domain, score float8, components jsonb)
 
+**007_collector_self_metrics.sql** — Collector self-monitoring:
+- `collector.collector_self_metrics` — Per-tick telemetry about the collector process itself: PID, uptime, per-buffer depths (10 buffers), total buffer depth, flush count, spill count, disk queue bytes, DB health status, tick duration (ms), total rows written. Indexed by `ts DESC`. Same raw retention as other metrics tables.
+
 All tables use `ts TIMESTAMPTZ` as the primary time column with descending indexes for efficient latest-value queries.
 
 ## Deployment
@@ -405,7 +408,7 @@ The service file runs the binary from `target/release/` directly. Alternatively,
 ### Prerequisites
 
 - PostgreSQL 15+ with the `collector` schema created
-- Run migrations in order: `001_collector_schema.sql`, `002_extended_pg_metrics.sql`, `003_intelligence_schema.sql`, `004_log_tables.sql`, `005_log_enhancements.sql`, `006_intelligence_v2.sql`
+- Run migrations in order: `001_collector_schema.sql`, `002_extended_pg_metrics.sql`, `003_intelligence_schema.sql`, `004_log_tables.sql`, `005_log_enhancements.sql`, `006_intelligence_v2.sql`, `007_collector_self_metrics.sql`
 - API server running on port 3003 with `/metrics` endpoint
 - Proxy server running on port 8082 with `/metrics/json` endpoint (optional)
 - Read access to log files in `/var/log/` (auth.log, kern.log, postgresql, apache2, fail2ban, letsencrypt, pqcrypta-proxy)
