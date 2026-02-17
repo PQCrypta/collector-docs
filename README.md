@@ -62,7 +62,7 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 **`system.rs`** — Collects host-level metrics. CPU usage is read directly from `/proc/stat` (delta-based jiffies calculation between ticks) providing accurate user, system, and idle percentages — bypasses the `sysinfo` crate's unreliable CPU reporting on Linux. Memory (total/used/available/swap), load averages (1/5/15 min), disk usage per mount (total/available/usage_pct stored as JSONB), and network bytes per interface still use `sysinfo`.
 
-**`process.rs`** — Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Tracks CPU percentage (delta-based calculation between samples), RSS bytes, VSZ bytes, file descriptor count, thread count, and process state. Filters to a configurable list of watched process names plus the top 25 non-target processes by RSS to catch resource hogs.
+**`process.rs`** — Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Tracks CPU percentage (delta-based calculation between samples), RSS bytes, VSZ bytes, file descriptor count, thread count, and process state. Collects a configurable list of watched process names plus all other processes with non-zero RSS, sorted by memory usage descending.
 
 **`app.rs`** — Application-level metric collection with two strategies:
 - **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics/json`) endpoints. Parses `ApiMetrics` (request counts, latency percentiles, error rates, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles).
