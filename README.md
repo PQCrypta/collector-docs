@@ -149,7 +149,7 @@ Computes error budget as `violations / allowed_violations * 100`. Generates `slo
 
 **Capacity predictions** (runs on `intel_tick`, every 5 min) — Linear regression on 24-hour hourly trends for 15 key metrics. Predicts when values will cross critical thresholds within the next 24 hours. Only alerts when R² >= 0.3 (reasonable trend confidence) and the current value is still below the threshold. Deduplicated to one alert per domain/metric per hour. Stored in `collector.capacity_alerts`.
 
-**Recommendations** — Rule-based checks generating actionable recommendations with auto-cleanup when conditions normalize:
+**Recommendations** — Rule-based checks generating actionable recommendations with auto-cleanup when conditions normalize. Deduplication uses `ON CONFLICT (category, target, title)` — all recommendation titles must be stable across ticks (no dynamic values like averages or counts that change every cycle). The index recommendation query excludes primary key (`_pkey`), unique constraint (`_key`), and `pg_constraint` type `p`/`u` indexes to prevent suggesting drops of constraint-enforcing indexes:
 
 | Category | Target | Trigger | Severity |
 |----------|--------|---------|----------|
@@ -187,7 +187,8 @@ Computes error budget as `violations / allowed_violations * 100`. Generates `slo
 | process | {name} | FDs > 500 (info), > 1000 (warn) | info/warn |
 | process | {name} | Crashed/stopped | critical |
 | process | {name} | Recently restarted (uptime < 5 min, known services) | warn |
-| index | unused:{name} | Unused indexes > 1MB (excludes primary keys) | info |
+| index | unused:{name} | Unused indexes > 1MB (excludes `_pkey`, `_key`, constraint types `p`/`u`) | info |
+| logs | {source} | Recurring error/warn patterns (>10 occurrences/hour) | info/warn |
 | security | {event_type} | Security events detected | warn |
 
 ### `src/log_ingest.rs`
