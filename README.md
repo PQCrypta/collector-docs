@@ -1,5 +1,7 @@
 # pqcrypta-collector
 
+> Auto-synced to [collector-docs](https://github.com/PQCrypta/collector-docs)
+
 Async metrics collector, log ingestion engine, and intelligence layer for PQCrypta infrastructure. Single-threaded Rust binary that scrapes system, process, application, and database metrics on configurable intervals, ingests logs from 13 sources with structured parsing, writes everything to PostgreSQL with batched inserts, performs time-series aggregation and retention, runs statistical anomaly detection with SLO tracking and actionable recommendations, and provides disk-backed durable queuing with cardinality protection.
 
 ## Architecture
