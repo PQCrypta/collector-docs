@@ -149,7 +149,9 @@ Computes error budget as `violations / allowed_violations * 100`. Generates `slo
 
 **Capacity predictions** (runs on `intel_tick`, every 5 min) — Linear regression on 24-hour hourly trends for 15 key metrics. Predicts when values will cross critical thresholds within the next 24 hours. Only alerts when R² >= 0.3 (reasonable trend confidence) and the current value is still below the threshold. Deduplicated to one alert per domain/metric per hour. Stored in `collector.capacity_alerts`.
 
-**Recommendations** — Rule-based checks generating actionable recommendations with auto-cleanup when conditions normalize. Deduplication uses `ON CONFLICT (category, target, title)` — all recommendation titles must be stable across ticks (no dynamic values like averages or counts that change every cycle). The index recommendation query excludes primary key (`_pkey`), unique constraint (`_key`), and `pg_constraint` type `p`/`u` indexes to prevent suggesting drops of constraint-enforcing indexes:
+**Recommendations** — Rule-based checks generating actionable recommendations with auto-cleanup when conditions normalize. Deduplication uses `ON CONFLICT (category, target, title)` — all recommendation titles must be stable across ticks (no dynamic values like averages or counts that change every cycle).
+
+The vacuum-check DISTINCT ON queries use `AND ts > now() - INTERVAL '30 minutes'` to scan only the ~N rows from the most recent collector tick instead of the full history (14-day default), reducing execution time from ~200ms to <1ms. The index recommendation query excludes primary key (`_pkey`), unique constraint (`_key`) indexes by naming convention — avoiding the expensive `pg_constraint` catalog join (removed in favour of naming-convention filters for 18× fewer buffer hits). Uses `AND ts > now() - INTERVAL '30 minutes'` for the same reason.
 
 | Category | Target | Trigger | Severity |
 |----------|--------|---------|----------|
@@ -373,6 +375,21 @@ Seven migration files in `migrations/`:
 - `collector.collector_self_metrics` — Per-tick telemetry about the collector process itself: PID, uptime, per-buffer depths (10 buffers), total buffer depth, flush count, spill count, disk queue bytes, DB health status, tick duration (ms), total rows written. Indexed by `ts DESC`. Same raw retention as other metrics tables.
 
 All tables use `ts TIMESTAMPTZ` as the primary time column with descending indexes for efficient latest-value queries.
+
+### Query-optimisation indexes (applied 2026-02-20)
+
+Applied directly to the live database; no migration file required for these performance indexes:
+
+| Index | Table | Type | Purpose |
+|-------|-------|------|---------|
+| `idx_index_raw_schema_table_name_ts` | `index_metrics_raw` | btree composite | Supports DISTINCT ON sort on `(schema_name, table_name, index_name, ts DESC)` |
+| `idx_index_raw_unused_large` | `index_metrics_raw` | partial (`idx_scan=0 AND size>1MB`) | Fast path for unused-index recommendation scans |
+| `idx_table_raw_schema_table_ts_desc` | `table_metrics_raw` | btree composite | `(schema_name, table_name, ts DESC)` — eliminates incremental sort on DISTINCT ON queries |
+| `idx_table_raw_live_positive_schema_table_ts` | `table_metrics_raw` | partial (`n_live_tup > 0`) | Vacuum-check DISTINCT ON with ts-bounded filter |
+| `idx_table_raw_live_schema_table_ts` | `table_metrics_raw` | partial (`n_live_tup > 100`) | Monitor dashboard DISTINCT ON with live-tuples filter |
+| `idx_table_raw_tablename_ts_desc` | `table_metrics_raw` | btree | `(table_name, ts DESC)` — direct seeks for single-table dead-ratio lookups |
+| `idx_key_vault_created_by_cleanup` | `key_vault` | btree | `(created_by, usage_count, created_at)` — key cleanup DELETE scans |
+| `idx_log_fph_level_bucket` | `log_fingerprint_hourly` | btree | `(level, bucket DESC)` — level-filtered fingerprint aggregation |
 
 ## Deployment
 
