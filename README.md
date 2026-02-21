@@ -553,6 +553,41 @@ The collector is designed to be lightweight despite 10s collection intervals:
 - Heartbeat decoupled from heavier watchdog checks to keep liveness detection fast
 - All intervals are configurable via TOML or environment variables
 
+## Monitor Dashboard
+
+The collector's data is surfaced through a real-time web dashboard at `/monitor/`. The dashboard auto-refreshes every 30 seconds and is organised into 12 tabs, each backed by a dedicated `api.php` mode that queries the collector schema.
+
+| Tab | API mode | Primary data sources |
+|-----|----------|----------------------|
+| System | `full` | `system_metrics_raw`, `system_metrics_hourly`, `alerts`, `health_scores` |
+| Processes | `full` | `process_metrics_raw`, `process_metrics_hourly` |
+| API & Proxy | `full` | `api_metrics_raw`, `api_metrics_hourly`, `proxy_metrics_raw` |
+| PostgreSQL | `full` | `db_metrics_raw`, `db_metrics_hourly`, `alerts` |
+| Tables & Indexes | `full` | `table_metrics_raw`, `index_metrics_raw` |
+| Queries | `full` | `statement_metrics_raw` |
+| Logs | `logs` | `log_entries`, `log_metrics_hourly`, `log_patterns`, `security_events` |
+| Alerts | `full` | `alerts`, `capacity_alerts` |
+| Insights | `full` | `insights`, `baselines`, `recommendations` |
+| Replication | `full` | `replication_metrics_raw` |
+| Collector | `full` | `collector_self_metrics`, `heartbeat` |
+| Event Snapshot | `snapshot` | all raw metric tables, `alerts`, `insights` |
+
+### Event Snapshot tab
+
+The Event Snapshot tab opens a time-windowed dashboard scoped to the exact moment of any detected anomaly. Click any row in the **Insights** table to activate it.
+
+**How it works** — clicking an insight row stores the insight's timestamp and switches to the Event Snapshot tab, which immediately fetches `api.php?mode=snapshot&ts=<ISO timestamp>&before=<min>&after=<min>`. The API queries all six raw metric tables (`system_metrics_raw`, `api_metrics_raw`, `db_metrics_raw`, `proxy_metrics_raw`, `alerts`, `insights`) for rows falling in the window `[ts − before, ts + after]` and returns them as a single JSON object. The dashboard renders the results without a full-page reload.
+
+**Time window controls** — preset buttons for ±2, 5, 10, 15, and 30 minutes flank the insight timestamp. Custom before/after values can be typed directly into the minute inputs. A Refresh button re-fetches with the current window. The window is clamped server-side to 1–60 minutes per side to prevent runaway queries.
+
+**Charts** — ten canvas-based time-series charts are drawn for the fetched window: CPU usage, memory used %, 1-min load average, network bytes/s, API RPS, API error rate %, API p95 latency ms, DB active connections, DB cache hit ratio, and proxy p95 latency ms. Each chart renders a vertical dashed annotation line at the insight's detection timestamp so the anomaly moment is immediately visible relative to surrounding metric behaviour.
+
+**Summary row** — peak and minimum stat cards for CPU, memory, load average, RPS, error rate, latency, DB connections, and DB cache hit are computed from the fetched window rows and displayed above the chart grid.
+
+**Co-occurring events table** — alerts and co-occurring insights from the same time window are merged into a single chronological table showing timestamp, type, severity, domain/metric, and message. This surfaces correlated signals (e.g., a DB cache drop insight alongside an API latency alert) without switching tabs.
+
+**Click handling** — row click detection uses event delegation on the `insights-tbody` element rather than per-row listeners. This is necessary because `MonTables.enhance()` rebuilds table rows via `cloneNode(true)` on every pagination or sort event, which strips any listeners attached directly to `<tr>` elements. The delegated listener reads a `data-snap-ins-idx` attribute (preserved through cloning) to look up the insight object from a module-level reference array.
+
 ## License
 
 MIT
