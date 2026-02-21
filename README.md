@@ -555,7 +555,7 @@ The collector is designed to be lightweight despite 10s collection intervals:
 
 ## Monitor Dashboard
 
-The collector's data is surfaced through a real-time web dashboard at `/monitor/`. The dashboard auto-refreshes every 30 seconds and is organised into 12 tabs, each backed by a dedicated `api.php` mode that queries the collector schema.
+The collector's data is surfaced through a real-time web dashboard at `/monitor/`. The dashboard auto-refreshes every 30 seconds and is organised into 12 tabs, each backed by a dedicated `api.php` mode that queries the `collector` schema. All charts use a custom canvas-based renderer (`MC.lineChart`, `MC.barChart`, `MC.pieChart`, `MC.gauge`, `MC.stackedBar`) — no external charting library. `MonTables.enhance()` wraps every sortable/filterable table with in-page pagination and live search.
 
 | Tab | API mode | Primary data sources |
 |-----|----------|----------------------|
@@ -564,25 +564,178 @@ The collector's data is surfaced through a real-time web dashboard at `/monitor/
 | API & Proxy | `full` | `api_metrics_raw`, `api_metrics_hourly`, `proxy_metrics_raw` |
 | PostgreSQL | `full` | `db_metrics_raw`, `db_metrics_hourly`, `alerts` |
 | Tables & Indexes | `full` | `table_metrics_raw`, `index_metrics_raw` |
-| Queries | `full` | `statement_metrics_raw` |
+| Queries | `full` | `statement_metrics_raw`, `io_metrics_raw` |
 | Logs | `logs` | `log_entries`, `log_metrics_hourly`, `log_patterns`, `security_events` |
-| Alerts | `full` | `alerts`, `capacity_alerts` |
-| Insights | `full` | `insights`, `baselines`, `recommendations` |
+| Alerts | `full` | `alerts`, `heartbeat` |
+| Insights | `full` | `insights`, `baselines`, `recommendations`, `slo_tracking`, `health_scores`, `capacity_alerts` |
 | Replication | `full` | `replication_metrics_raw` |
-| Collector | `full` | `collector_self_metrics`, `heartbeat` |
+| Collector | `full` | `collector_self_metrics`, `process_metrics_raw`, `heartbeat` |
 | Event Snapshot | `snapshot` | all raw metric tables, `alerts`, `insights` |
+
+### System tab
+
+Overview of host-level resource health. Stat cards show the latest values with colour-coded thresholds (warn/critical) and trend arrows derived from baseline z-scores:
+
+- **CPU** — combined user + system %, idle %. Warn ≥ 70%, critical ≥ 80%.
+- **Memory** — used bytes, available bytes, swap used/total. Mem warn ≥ 75%, critical ≥ 85%; swap warn ≥ 50%.
+- **Load averages** — 1/5/15-minute load. Colour-codes against baseline.
+- **Network** — latest `net_rx` / `net_tx` byte totals from `sysinfo`.
+- **Disk** — per-mount usage card grid (filtered to exclude snap.rootfs and pseudo-mounts). Cards turn red ≥ 90%, yellow ≥ 75%. Horizontal bar chart shows all mounts at a glance.
+
+Time-series charts cover CPU %, memory used vs available (GB), all three load averages, and network RX/TX rate (bytes/s computed as delta ÷ 10s interval). The network chart computes deltas between successive raw samples, clamping negative deltas (counter resets) to zero.
+
+### Processes tab
+
+Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Issues are classified across five dimensions and colour-coded per column:
+
+| Dimension | Info | Warn | Critical |
+|-----------|------|------|----------|
+| CPU % | ≥ 20% | ≥ 50% | ≥ 80% |
+| RSS | ≥ 256 MB | ≥ 512 MB | ≥ 1 GB |
+| File descriptors | ≥ 200 | ≥ 500 | ≥ 1000 |
+| Threads | ≥ 100 | ≥ 200 | ≥ 500 |
+| State | — | T (stopped) | Z (zombie) / D (uninterruptible) |
+
+Processes are sorted highest-severity-first, then by CPU descending within the same severity. A filter bar above the table lets you narrow to any single issue dimension (Issues / CPU / RSS / FDs / Threads / State). The filter selection persists in `localStorage`. The tab badge and each filter button show a live count of affected processes, colour-coded to the worst severity seen. `MonTables` search re-counts the badge to reflect the currently visible rows rather than the full dataset.
+
+Columns: process name, PID, CPU %, RSS, VSZ, FD count, thread count, state, uptime.
+
+### API & Proxy tab
+
+Split into two sections: API server (port 3003) and reverse proxy (port 8082).
+
+**API section** — stat cards: uptime, RPS, total/successful/failed requests, error rate %, average response ms, active connections, active sessions, CPU %, memory, throughput MB/s, DB connections, DB response time ms, DB cache hit ratio. DB response > 50 ms turns amber, > 100 ms turns red. Cache hit < 99% turns amber, < 95% turns red.
+
+Two time-series charts:
+- **RPS & Error Rate** — dual series (RPS on primary axis, error rate % on secondary) with threshold zones at 1% (warn) and 5% (critical) error rate.
+- **Latency percentiles** — p50/p95/p99 ms with reference lines at 200 ms (good), 500 ms (SLO), 1000 ms (slow).
+
+**Per-endpoint error breakdown** — fetched separately from `api.php?mode=api_errors` with a 30-second client-side cache. Renders a two-row grouped header (Client Errors 4xx / Server Errors 5xx) with individual status code columns (400, 401, 403, 404, 405, 408, 409, 413, 422, 429, 500, 502, 503, 504). Each row shows endpoint path, total failures, per-code counts, last seen timestamp, and share of total failures. Clickable badge filters narrow by last HTTP status code.
+
+**Recent failures table** — the 100 most recent individual failed requests with path, status code, timestamp. Badge filter by status code.
+
+**Proxy section** — stat cards: uptime, total/success/client-error/server-error/in-progress request counts, bytes received/sent, latency p50/p95/p99, connection counts (HTTP/3, HTTP/2, HTTP/1.1, WebTransport), TLS stats (total/PQC/classical handshakes, PQC enabled flag), rate-limit stats (checked/allowed/limited/blocked), active connections, handshake failures.
+
+### PostgreSQL tab
+
+Deep PostgreSQL health view backed by `db_metrics_raw` which aggregates `pg_stat_*` catalog views.
+
+- **Cache hit gauge** — radial gauge (0–100%) with colour zones: red < 90%, amber < 97%, green ≥ 97%.
+- **Wait events pie** — IO / Lock / LWLock / BufferPin / Activity / Client / IPC / Timeout segments; empty segments hidden.
+- **Lock distribution bar** — horizontal bar chart across seven PostgreSQL lock modes (AccessShare → AccessExclusive).
+- **Connection cards** — active, idle, waiting connections. Waiting > 1 turns amber, > 5 turns red.
+- **Transaction cards** — commit and rollback counts. Deadlocks > 0 turns red; slow queries > 1 turns amber, > 5 turns red.
+- **Checkpoint & WAL cards** — timed/requested checkpoints, checkpoint write/sync time, buffers written by checkpoint/cleaner/backends, WAL records/bytes/full-page images, WAL write/sync time.
+- **Transaction trend chart** — commits vs rollbacks over the history window.
+
+### Tables & Indexes tab
+
+Per-table and per-index stats from `pg_stat_user_tables` and `pg_stat_user_indexes`.
+
+**Tables table** — schema.table, total size, live tuples, dead tuples, dead tuple %, seq scans, index scans, last autovacuum, last autoanalyze. Dead tuple % ≥ 10% turns amber, ≥ 20% turns red.
+
+**Vacuum needed table** — tables where dead tuples exceed 10% of live tuples and live count > 100, showing dead count, ratio, and time since last autovacuum.
+
+**Unused indexes table** — indexes with zero scans sorted by size descending. Shows schema.table, index name, size, scan count. Helps identify candidates for removal.
+
+All three sub-tables are independently sortable and searchable via `MonTables`.
+
+### Queries tab
+
+Top SQL statements from `pg_stat_statements` plus I/O breakdown from `pg_stat_io` (PG16+).
+
+**Top queries table** — rank, total execution time, call count, mean exec time, max exec time, rows returned, shared blocks hit/read, temp blocks read/written, block read/write time, WAL records, query text (truncated to 120 chars, full text in tooltip). Query text is sanitised server-side to redact password/secret/token literals before display. Mean > 500 ms turns amber, > 1000 ms turns red. Max > 2000 ms turns amber, > 5000 ms turns red. Temp blocks > 0 turns amber, > 1000 turns red.
+
+**I/O by backend type** — horizontal stacked bar chart aggregating reads, writes, and hits across all backend types (client backend, autovacuum worker, WAL sender, background writer, etc.).
+
+**I/O summary cards** — total read time, write time, evictions, fsyncs, and buffer hit ratio aggregated across all backend types.
+
+**I/O detail table** — per-row breakdown of backend type, object, context, reads, read time, writes, write time, hits, evictions, reuses, fsyncs, fsync time.
+
+### Logs tab
+
+Log data is fetched separately via `api.php?mode=logs` with a 30-second client-side cache. The tab is split into eight sub-sections:
+
+- **Log health gauge** — radial gauge (0–100%) derived from the error/warn ratio in the most recent hour.
+- **Error distribution pie** — proportion of error vs warn vs info log entries.
+- **Source health grid** — one card per log source showing entry count, error rate, and health status.
+- **Error rate trend chart** — hourly error/warn/total counts over the past 24 hours from `log_metrics_hourly`.
+- **Security events table** — SSH brute force, fail2ban ban actions, UFW/firewall blocks from `security_events`. Filterable by event type badge.
+- **Top error patterns table** — recurring fingerprints from `log_patterns` with occurrence count, first/last seen, and sample message. Filterable by source and level via dual badge filter.
+- **Log volume chart** — stacked hourly volume by level (error/warn/info) over 24 hours.
+- **Log entries table** — the 200 most recent raw log entries (ts, source, level, component, message). Filterable by source and level badge filters; full-text searchable via `MonTables`.
+
+### Alerts tab
+
+Active alerts from the watchdog and intelligence engine.
+
+**Alerts table** — timestamp, alert type, component, message. Alert type badges allow one-click filtering by type (staleness, table_health, process_health, api_error_rate, db_response_time, long_query, connection_leak, io_pressure, slo_violation, etc.). Empty table shows green "No active alerts" confirmation.
+
+**Heartbeat table** — recent heartbeat records from `collector.heartbeat` showing timestamp, component, and status (ALIVE / other). Status is colour-coded green/red. Filterable by component badge.
+
+Both tables use `MonTables` for pagination and search.
+
+### Insights tab
+
+The intelligence layer's output in a single view. Six distinct sections:
+
+**Insight summary cards** — clickable cards for total insight count, per-severity counts (critical/warn/info), and per-insight-type counts. Clicking a card applies a filter to the Active Insights table below.
+
+**Health scores** — per-domain composite scores (0–100) displayed as colour-coded stat cards for system, api, db, proxy, logs, process, io, replication, and statement domains. Score < 40 turns red, < 70 turns amber.
+
+**Active Insights table** — anomalies detected in the last 7 days: timestamp, insight type, severity, domain, metric key, current value, baseline mean, z-score, drift %, message. Rows are clickable — clicking any row opens the **Event Snapshot** tab scoped to that anomaly's timestamp. Severity column colour-coded (critical = red, warn = amber, info = green). Row background accent for `correlation` and `log_metric_correlation` types.
+
+**Baselines table** — the 43 statistical baselines across 9 domains: domain, metric, 7-day mean, stddev, p50, p95, sample count, last updated. Filterable by domain badge. Gives a snapshot of what "normal" looks like for each metric.
+
+**Recommendations table** — active actionable recommendations with category, severity, target, title, and description. Category badges (vacuum/system/api/proxy/db/performance/process/index/logs/security) and severity badges allow independent filtering. Badge counts update immediately on click without a data re-fetch.
+
+**SLO tracking table** — per-SLO actual vs target values, met/not-met status, error budget consumed, violation count, and evaluation period count. Colour-codes the met column green/red.
+
+**Capacity predictions table** — linear regression forecasts from `capacity_alerts`: domain, metric, current value, predicted value, threshold, hours until breach, R² confidence, message. Only shown when predictions exist.
+
+### Replication tab
+
+Per-slot replication health from `pg_stat_replication`.
+
+**Summary cards** — slot count, maximum replay lag ms (warn ≥ 100 ms, critical ≥ 1000 ms), maximum flush lag ms (same thresholds), WAL status summary.
+
+**Slots table** — slot name, type, active (green/red), client address, state, WAL status, replay lag ms, flush lag ms, write lag ms. All three lag columns are colour-coded (amber ≥ 100 ms, red ≥ 1000 ms). Sortable and searchable via `MonTables`. Hidden with an empty-state message when no replication slots exist.
+
+The tab badge shows the count of slots with replay lag ≥ 1000 ms, coloured amber when non-zero.
+
+### Collector tab
+
+Self-monitoring for the collector binary itself using `collector_self_metrics` (written by the collector each tick) and cross-referenced against `process_metrics_raw`.
+
+**Overview cards** — running status (green/red), PID, uptime, binary size, binary build time (mtime), total rows written lifetime.
+
+**Resource usage cards** — CPU % (warn ≥ 3%, critical ≥ 5%), RSS (warn ≥ 48 MB, critical ≥ 60 MB), VSZ, file descriptor count (warn ≥ 50, critical ≥ 200), thread count (warn ≥ 4, critical ≥ 10), process state (Z/T = red, D = amber). Cards highlight with a border accent when thresholds are breached.
+
+**Resource trend charts** — CPU % and RSS over the history window, from `process_metrics_raw` for the collector PID.
+
+**Operational health cards** — total buffer depth (warn ≥ 500, critical ≥ 800), flush count, spill count (any spill > 0 highlights amber — indicates DB was unavailable), disk queue bytes (any non-zero highlights amber), DB connection health (healthy/unhealthy), tick duration ms (warn ≥ 5 s, critical ≥ 9 s).
+
+**Buffer breakdown table** — per-buffer depth (System/Process/API/Proxy/DB/Table/Index/IO/Replication/Statements) as an inline progress bar. Bar turns amber ≥ 40% full, red ≥ 80% full. Buffer depths are captured pre-flush so the chart reflects actual accumulation during each collection cycle.
+
+**Tick performance charts** — tick duration ms and total buffer depth over time, useful for identifying slow ticks or accumulation during DB outages.
+
+**Heartbeat monitor cards** — age of last heartbeat (warn > 30 s, critical > 60 s), heartbeat count, gap count. Gaps table shows each detected gap with previous timestamp, gap timestamp, and gap duration in seconds. Empty-state message shown when no gaps exist.
+
+**Configuration table** — hot-reloadable configuration fields read from `collector_self_metrics` (batch size, query timeout, collection intervals, retention days). Allows verifying the live config without accessing the TOML file.
 
 ### Event Snapshot tab
 
-The Event Snapshot tab opens a time-windowed dashboard scoped to the exact moment of any detected anomaly. Click any row in the **Insights** table to activate it.
+The Event Snapshot tab opens a time-windowed dashboard scoped to the exact moment of any detected anomaly. Click any row in the **Active Insights** table (Insights tab) to activate it.
 
 **How it works** — clicking an insight row stores the insight's timestamp and switches to the Event Snapshot tab, which immediately fetches `api.php?mode=snapshot&ts=<ISO timestamp>&before=<min>&after=<min>`. The API queries all six raw metric tables (`system_metrics_raw`, `api_metrics_raw`, `db_metrics_raw`, `proxy_metrics_raw`, `alerts`, `insights`) for rows falling in the window `[ts − before, ts + after]` and returns them as a single JSON object. The dashboard renders the results without a full-page reload.
 
+**Insight context card** — displayed at the top of the snapshot panel: insight type, severity pill, domain/metric, detection timestamp, current value, baseline mean, z-score, drift %, and the full human-readable message.
+
 **Time window controls** — preset buttons for ±2, 5, 10, 15, and 30 minutes flank the insight timestamp. Custom before/after values can be typed directly into the minute inputs. A Refresh button re-fetches with the current window. The window is clamped server-side to 1–60 minutes per side to prevent runaway queries.
 
-**Charts** — ten canvas-based time-series charts are drawn for the fetched window: CPU usage, memory used %, 1-min load average, network bytes/s, API RPS, API error rate %, API p95 latency ms, DB active connections, DB cache hit ratio, and proxy p95 latency ms. Each chart renders a vertical dashed annotation line at the insight's detection timestamp so the anomaly moment is immediately visible relative to surrounding metric behaviour.
+**Summary row** — peak and minimum stat cards for CPU, memory, load average, RPS, error rate, latency, DB connections, and DB cache hit ratio are computed from the fetched window rows and displayed above the chart grid.
 
-**Summary row** — peak and minimum stat cards for CPU, memory, load average, RPS, error rate, latency, DB connections, and DB cache hit are computed from the fetched window rows and displayed above the chart grid.
+**Charts** — ten canvas-based time-series charts drawn for the fetched window: CPU usage %, memory used %, 1-min load average, network bytes/s, API RPS, API error rate %, API p95 latency ms, DB active connections, DB cache hit ratio, and proxy p95 latency ms. Each chart renders a vertical dashed red annotation line at the insight's detection timestamp so the anomaly moment is immediately visible relative to surrounding metric behaviour.
 
 **Co-occurring events table** — alerts and co-occurring insights from the same time window are merged into a single chronological table showing timestamp, type, severity, domain/metric, and message. This surfaces correlated signals (e.g., a DB cache drop insight alongside an API latency alert) without switching tabs.
 
