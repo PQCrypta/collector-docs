@@ -663,7 +663,7 @@ Log data is fetched separately via `api.php?mode=logs` with a 30-second client-s
 - **Security events table** — SSH brute force, fail2ban ban actions, UFW/firewall blocks from `security_events`. Filterable by event type badge.
 - **Top error patterns table** — recurring fingerprints from `log_patterns` with occurrence count, first/last seen, and sample message. Filterable by source and level via dual badge filter.
 - **Log volume chart** — stacked hourly volume by level (error/warn/info) over 24 hours.
-- **Log entries table** — the 200 most recent raw log entries (ts, source, level, component, message). Filterable by source and level badge filters; full-text searchable via `MonTables`.
+- **Log entries table** — up to 500 most recent raw log entries (50 per source, merged and sorted newest-first). Columns: ts, source, level, component, message. Filterable by source and level badge filters; full-text searchable via `MonTables`.
 
 ### Alerts tab
 
