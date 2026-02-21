@@ -219,6 +219,8 @@ Streaming log ingestion engine that polls 13 sources every 15 seconds:
 
 **Journal ingestion** — Runs `journalctl -u UNIT -o json --after-cursor=X -n N` as an async subprocess. Handles MESSAGE fields that arrive as byte arrays (ANSI-encoded output from Rust tracing). Strips ANSI escape sequences and extracts level/component from tracing format. First run limits to 100 lines to avoid massive backfill.
 
+**Continuation-line filtering** — When a Rust service uses `tracing_subscriber` at `DEBUG` level with multi-line spans (e.g. SQL queries formatted across multiple lines), journald captures each line as a separate journal entry. Lines that are continuations of a multi-line tracing event share no timestamp prefix and begin with leading whitespace. The ingester skips any message that starts with a space or tab and does not begin with a 4-digit year (ISO timestamp), preventing SQL fragment lines from being stored as individual log entries and inflating the `total_count` baseline. The upstream fix is to set the API's `tracing_subscriber` to `INFO` level with `.with_ansi(false)` — see the [API log level note](#api-log-level) in the Deployment section.
+
 **7 parsers:**
 1. **postgresql** — `%m [%p] %q%u@%d LEVEL: message`, handles multi-line STATEMENT continuation, skips empty messages from HINT/DETAIL lines
 2. **journalctl** — JSON objects with `MESSAGE`, `PRIORITY`, `SYSLOG_IDENTIFIER`, `__CURSOR`; handles byte-array MESSAGE and Rust tracing format
@@ -415,6 +417,22 @@ Environment=COLLECTOR_CONFIG=/etc/pqcrypta/collector.toml
 
 [Install]
 WantedBy=multi-user.target
+```
+
+### API log level
+
+The API service (`pqcrypta-api`) must run with `tracing_subscriber` at `INFO` level and ANSI output disabled. Using `DEBUG` level causes multi-line tracing spans (e.g. SQL statements) to be emitted to stderr across multiple lines; journald records each line as a separate entry, and the collector ingests all of them, inflating the `logs/total_count` baseline by 3× or more.
+
+Required configuration in `api/src/main.rs`:
+
+```rust
+tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::INFO)
+    .with_target(true)
+    .with_thread_ids(true)
+    .with_line_number(true)
+    .with_ansi(false)       // no ANSI escape codes in journald
+    .init();
 ```
 
 ### Build
