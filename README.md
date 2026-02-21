@@ -80,7 +80,7 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 **`retention.rs`** — Time-series aggregation and cleanup:
 - **Hourly rollups**: Aggregates raw rows from the past hour into `*_hourly` tables using `AVG`, `MAX`, `MIN`. Covers system, process, API, DB, table, and IO metrics. Uses `ON CONFLICT (bucket) DO UPDATE` for idempotent upserts.
-  - **Cumulative counter handling**: API metrics `total_requests` and `failed_requests` are cumulative counters — the hourly rollup uses `GREATEST(max(col) - min(col), 0)` to compute per-hour deltas instead of `sum()`, which would produce inflated counts from cumulative snapshots.
+  - **Restart-safe counter handling**: API metrics `total_requests` and `failed_requests` are cumulative counters that reset to 0 on API restart. The hourly rollup computes per-interval deltas using a LAG window function (`GREATEST(col - LAG(col), 0)`), clamping negative deltas (counter resets) to 0 before summing across the hour. This prevents an API restart mid-window from producing a false spike equal to the pre-restart maximum.
   - **DB response time**: Includes `avg(db_response_ms)` in the API hourly rollup for baseline tracking.
 - **Daily rollups**: Aggregates hourly rows from the past day into `*_daily` tables.
 - **Retention cleanup**: Deletes raw data older than configured days (default 14), hourly data older than configured days (default 90), daily data older than configured days (default 365).
@@ -146,6 +146,10 @@ Includes per-table anomaly detection for dead tuple ratio baselines. Deduplicate
 Computes error budget as `violations / allowed_violations * 100`. Generates `slo_violation` insights and `slo_breach` alerts when SLOs are not met. Skipped for the first 2 minutes after collector restart to let a few collection cycles populate fresh data. New SLOs can be added by inserting rows into `slo_definitions`.
 
 **Health scores** (runs on `intel_tick`, every 5 min) — Per-domain composite health score (0–100) computed from baseline z-scores. Each baselined metric in a domain gets a component score: 100 (|z| < 1), 80 (|z| < 1.5), 60 (|z| < 2), 40 (|z| < 2.5), 20 (|z| < 3), 0 (|z| >= 3). "Lower is better" metrics (latency, errors, CPU) only penalize positive z-scores (spikes). Domain score is the average of all component scores. Stored in `collector.health_scores` with JSON component breakdown.
+
+Two special-case overrides prevent false-positive health penalties:
+- **Cumulative DB counters excluded**: `xact_rollback`, `wal_bytes`, `wal_sync_time`, `checkpoint_write_time`, and `checkpoint_sync_time` are monotonically increasing `pg_stat` accumulators — their absolute values grow over the lifetime of the cluster, making z-score comparison against a rolling baseline meaningless. These metrics are skipped during health score computation for the `db` domain. (`blks_read` was already excluded.)
+- **API `error_rate_pct` uses hourly average**: The raw `api_metrics_raw.error_rate_pct` column stores the cumulative `failed/total` ratio since the last API start. As the total request count grows, this ratio drifts slowly toward zero regardless of current behaviour. Health scoring for `api/error_rate_pct` instead reads `error_rate_avg` from `api_metrics_hourly` (the per-interval average, updated by the restart-safe LAG rollup), which accurately reflects current error rates.
 
 **Capacity predictions** (runs on `intel_tick`, every 5 min) — Linear regression on 24-hour hourly trends for 15 key metrics. Predicts when values will cross critical thresholds within the next 24 hours. Only alerts when R² >= 0.3 (reasonable trend confidence) and the current value is still below the threshold. Deduplicated to one alert per domain/metric per hour. Stored in `collector.capacity_alerts`.
 
@@ -267,7 +271,7 @@ Health monitoring runs on a dedicated 30s tick, decoupled from the 5s heartbeat:
 - **Heartbeat** (5s): Inserts liveness row into `collector.heartbeat`
 - **Staleness check** (30s): Alerts if last heartbeat exceeds 6x heartbeat interval
 - **Table health** (30s): Detects bloated tables (dead tuples > 20% with > 1000 live rows and > 500 dead rows) and tables not vacuumed in 7+ days
-- **Process health** (30s): Checks for high CPU (> 50%), high memory (> 1GB RSS), high FDs (> 1000), high threads (> 500), bad states (zombie/D-state/stopped), and expected processes that are missing. Condition-based auto-resolve: when a process metric returns to healthy, its alert is resolved immediately (no time-based delay).
+- **Process health** (30s): Checks for high CPU (> 50%), high memory (> 3GB RSS), high FDs (> 1000), high threads (> 500), bad states (zombie/D-state/stopped), and expected processes that are missing. The 3 GB threshold accounts for `pqcrypta-api`'s baseline RSS (~2.4 GB with 31 cryptographic engine libraries and ML models loaded at startup). Condition-based auto-resolve: when a process metric returns to healthy, its alert is resolved immediately (no time-based delay).
 - **API error rate** (30s): Alerts if error rate exceeds 5% with > 100 total requests. Auto-resolves when error rate drops below threshold.
 - **DB response time** (30s): Alerts if 5-minute average DB response time exceeds 100ms. Auto-resolves when response time drops below threshold.
 - **Long queries** (30s): Queries `pg_stat_activity` for queries running > 30 seconds. Records `long_query` alert with PID, duration, and truncated query text. Auto-resolves when no long queries detected.
