@@ -729,17 +729,30 @@ The Event Snapshot tab opens a time-windowed dashboard scoped to the exact momen
 
 **How it works** — clicking an insight row stores the insight's timestamp and switches to the Event Snapshot tab, which immediately fetches `api.php?mode=snapshot&ts=<ISO timestamp>&before=<min>&after=<min>`. The API queries all six raw metric tables (`system_metrics_raw`, `api_metrics_raw`, `db_metrics_raw`, `proxy_metrics_raw`, `alerts`, `insights`) for rows falling in the window `[ts − before, ts + after]` and returns them as a single JSON object. The dashboard renders the results without a full-page reload.
 
-**Insight context card** — displayed at the top of the snapshot panel: insight type, severity pill, domain/metric, detection timestamp, current value, baseline mean, z-score, drift %, and the full human-readable message.
+**Insight context card** — displayed at the top of the snapshot panel: insight type, severity pill, domain/metric, detection timestamp, current value, baseline mean, z-score, drift %, and the full human-readable message. Every element in this card carries a tooltip:
+- **Severity pill** — explains the severity level (critical/warn/info) and what it implies.
+- **Type pill** — describes the detection method or insight category.
+- **Detected / Current / Baseline / Z-Score / Drift stat boxes** — each box tooltip explains what the value represents, how to interpret it, and the relevant thresholds. For chart-point snapshots, Selected Time and Value are explained instead.
 
-**Time window controls** — preset buttons for ±2, 5, 10, 15, and 30 minutes flank the insight timestamp. Custom before/after values can be typed directly into the minute inputs. A Refresh button re-fetches with the current window. The window is clamped server-side to 1–60 minutes per side to prevent runaway queries.
+**Time window controls** — preset buttons for ±2, 5, 10, 15, and 30 minutes flank the insight timestamp. Custom before/after values can be typed directly into the minute inputs. A Refresh button re-fetches with the current window. The window is clamped server-side to 1–60 minutes per side to prevent runaway queries. Every control carries a tooltip: preset buttons show the total window duration, the numeric inputs explain the valid range, and the Apply button describes the action.
 
-**Summary row** — peak and minimum stat cards for CPU, memory, load average, RPS, error rate, latency, DB connections, and DB cache hit ratio are computed from the fetched window rows and displayed above the chart grid.
+**Summary row** — peak and minimum stat cards for CPU, memory, load average, RPS, error rate, latency, DB connections, DB cache hit ratio, deadlocks, slow queries, top process CPU, and log error/warning counts are computed from the fetched window rows and displayed above the chart grid. Each card carries an intelligent tooltip with:
+- What the metric measures and how it is calculated.
+- Warning (⚠) and critical (⛔) thresholds with exact values.
+- The healthy range for reference.
+- Actionable guidance (e.g., "run EXPLAIN ANALYZE", "increase shared_buffers", "check the Top Process table").
 
-**Charts** — ten canvas-based time-series charts drawn for the fetched window: CPU usage %, memory used %, 1-min load average, network bytes/s, API RPS, API error rate %, API p95 latency ms, DB active connections, DB cache hit ratio, and proxy p95 latency ms. Each chart renders a vertical dashed red annotation line at the insight's detection timestamp so the anomaly moment is immediately visible relative to surrounding metric behaviour.
+**Section headings** — the four section headings (Peak/Min Values, System State Charts, Top Processes, Co-occurring Events) each carry a tooltip summarising the section's purpose and how to read it.
 
-**Co-occurring events table** — alerts and co-occurring insights from the same time window are merged into a single chronological table showing timestamp, type, severity, domain/metric, and message. This surfaces correlated signals (e.g., a DB cache drop insight alongside an API latency alert) without switching tabs.
+**Charts** — twelve canvas-based time-series charts drawn for the fetched window: CPU system/user %, memory used vs available (GB), 1m/5m load averages, network RX/TX (MB/s), API RPS, API error rate %, API p50/p95/p99 latency ms, DB active/idle/waiting connections, DB cache hit ratio %, DB wait events (Lock/IO/LWLock/Client), DB write activity (inserted/updated/deleted tuples), and proxy p95/p99 latency ms. Each chart box carries a tooltip on hover explaining what the series lines mean, what to look for (e.g., diverging p50/p99, used↑/available↓ divergence), and how to correlate it with other charts. Each chart renders a vertical dashed red annotation line at the insight's detection timestamp so the anomaly moment is immediately visible relative to surrounding metric behaviour.
+
+**Top Processes table** — processes observed during the window ranked by peak CPU. Column headers carry tooltips: Process (aggregation explained), Peak CPU % (threshold indicators), Peak Memory (RSS explained). Rows sorted by peak CPU descending.
+
+**Co-occurring events table** — alerts, co-occurring insights, and log entries from the same time window are merged into a single chronological table showing timestamp, type, severity, source, and message. Column headers carry tooltips explaining each field. Individual rows carry tooltips showing the full message text, event kind, severity, source, and absolute timestamp — useful when the Message column is truncated. This surfaces correlated signals (e.g., a DB cache drop insight alongside an API latency alert) without switching tabs.
 
 **Click handling** — row click detection uses event delegation on the `insights-tbody` element rather than per-row listeners. This is necessary because `MonTables.enhance()` rebuilds table rows via `cloneNode(true)` on every pagination or sort event, which strips any listeners attached directly to `<tr>` elements. The delegated listener reads a `data-snap-ins-idx` attribute (preserved through cloning) to look up the insight object from a module-level reference array.
+
+**Tooltip system** — all tooltips in the Event Snapshot tab use the same JS tooltip engine (`data-tip` attribute + mouseover delegation, rendered in a fixed-position element appended to `<body>`) as every other dashboard tab. This makes them immune to `overflow: hidden` clipping on chart containers and cards. All elements with `data-tip` automatically receive `cursor: help` via the global `[data-tip] { cursor: help }` CSS rule.
 
 ## License
 
