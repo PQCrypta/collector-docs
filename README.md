@@ -50,7 +50,7 @@ Async metrics collector, log ingestion engine, and intelligence layer for PQCryp
 | `config_tick` | 60s | Config file hot-reload (mtime-based change detection) |
 | `pg_extended_tick` | 5min | Per-table, per-index, IO, replication, statement stats |
 | `intel_tick` | 5min | Anomaly detection, recommendations, health scores, capacity predictions, log pattern analysis, error spike detection, security event detection |
-| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup, stale cardinality pruning, fingerprint budget reset. First tick is consumed at startup (no-op); a one-shot 3-minute delayed startup runs aggregation + baselines + SLOs once data has accumulated. |
+| `agg_tick` | 1hr | Hourly/daily rollups, retention cleanup (raw 14d, hourly 90d, daily 365d defaults), baseline recomputation, SLO computation, log metric aggregation, log data cleanup, stale cardinality pruning, fingerprint budget reset, trend forecast computation (linear regression over 7-day hourly series), seasonal baseline computation (168 hour-of-week slots over 30 days). First tick is consumed at startup (no-op); a one-shot 3-minute delayed startup runs aggregation + baselines + SLOs + trend/seasonal computation once data has accumulated. |
 
 The fast-path ticks (sys, app, heartbeat) are designed for negligible resource impact:
 - `sysinfo` reads from `/proc` (kernel shared memory, no disk I/O)
@@ -67,7 +67,7 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 **`process.rs`** — Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Tracks CPU percentage (delta-based calculation between samples), RSS bytes, VSZ bytes, file descriptor count, thread count, and process state. Collects a configurable list of watched process names plus all other processes with non-zero RSS, sorted by memory usage descending.
 
 **`app.rs`** — Application-level metric collection with two strategies:
-- **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics/json`) endpoints. Parses `ApiMetrics` (request counts, latency percentiles, error rates, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles).
+- **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics/json`) endpoints. Parses `ApiMetrics` (request counts, latency percentiles, error rates, `waf_blocked_requests`, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles). `waf_blocked_requests` tracks requests blocked by the WAF IP-blocklist and bot-blocklist — kept separate from `failed_requests` so bot attacks do not inflate error-rate SLOs.
 - **Direct PG queries**: Executes against `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_stat_io` (PG16+), `pg_stat_replication`, `pg_stat_statements`, `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_activity` (wait events/locks). Collects 6 tiers of database metrics: connection pool stats, per-table stats (live/dead tuples, seq/idx scans, modifications), per-index stats (scans, reads, fetches, size), per-backend-type IO stats (reads, writes, hits, evictions, fsyncs with timing), replication lag, and statement-level stats (calls, total/mean time, rows).
 
 ### `src/db/`
@@ -80,7 +80,7 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 
 **`retention.rs`** — Time-series aggregation and cleanup:
 - **Hourly rollups**: Aggregates raw rows from the past hour into `*_hourly` tables using `AVG`, `MAX`, `MIN`. Covers system, process, API, DB, table, and IO metrics. Uses `ON CONFLICT (bucket) DO UPDATE` for idempotent upserts.
-  - **Restart-safe counter handling**: API metrics `total_requests` and `failed_requests` are cumulative counters that reset to 0 on API restart. The hourly rollup computes per-interval deltas using a LAG window function (`GREATEST(col - LAG(col), 0)`), clamping negative deltas (counter resets) to 0 before summing across the hour. This prevents an API restart mid-window from producing a false spike equal to the pre-restart maximum.
+  - **Restart-safe counter handling**: API metrics `total_requests`, `failed_requests`, and `waf_blocked_requests` are cumulative counters that reset to 0 on API restart. The hourly rollup computes per-interval deltas using a LAG window function (`GREATEST(col - LAG(col), 0)`), clamping negative deltas (counter resets) to 0 before summing across the hour. This prevents an API restart mid-window from producing a false spike equal to the pre-restart maximum.
   - **DB response time**: Includes `avg(db_response_ms)` in the API hourly rollup for baseline tracking.
 - **Daily rollups**: Aggregates hourly rows from the past day into `*_daily` tables.
 - **Retention cleanup**: Deletes raw data older than configured days (default 14), hourly data older than configured days (default 90), daily data older than configured days (default 365).
@@ -92,6 +92,10 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 Statistical intelligence engine with `Severity` enum (`Info`, `Warn`, `Critical`) for type-safe alert classification:
 
 **Baselines** (runs on `agg_tick`, hourly) — Computes 7-day and 30-day rolling mean, stddev, and percentiles (p5/p25/p50/p75/p95) for 43 global metrics across 9 domains plus dynamic per-table `dead_tup_ratio`. Stores in `collector.baselines` with `ON CONFLICT` upsert. Requires minimum 6 samples before establishing a baseline. Skips NULL, NaN, and Inf values to prevent pollution from incomplete data windows.
+
+**Trend forecasts** (runs on `agg_tick`, hourly) — For each of 49 baselined metrics (same set as baselines, covering all 9 domains plus per-table `dead_tup_ratio`), fetches hourly values from the past 7 days and runs linear regression using the existing `linear_regression()` function (slope, intercept, R²). Computes `slope_per_hour` (converted from per-epoch slope × 3600), `forecast_1h` / `forecast_6h` / `forecast_24h` extrapolations, a `trend_direction` label (`rising`, `falling`, `stable`), and a `confidence` score (R²). Results are upserted into `collector.trend_forecasts`. Feeds the Baselines table's Trend column in the monitor dashboard.
+
+**Seasonal baselines** (runs on `agg_tick`, hourly) — For the same 49 metrics, fetches 30 days of raw values grouped by `hour_of_week` (0–167, computed as `(ISODOW - 1) * 24 + HOUR`). Groups and aggregates in Rust by `i16` hour-of-week key, computing mean, stddev, p50, p95, and sample_count per slot. Upserts into `collector.baselines_hourly` (168 slots per metric). Enables time-of-week-aware anomaly context — the Baselines table's Seasonal column shows the current-hour-of-week baseline. Requires `hour_of_week` stored as `smallint` (`i16`) in PostgreSQL.
 
 | Domain | Metrics |
 |--------|---------|
@@ -128,7 +132,9 @@ Includes per-table anomaly detection for dead tuple ratio baselines. Deduplicate
 
 **Log-metric cross-correlation** — When a log error spike coincides with metric anomalies from other domains, a `log_metric_correlation` insight is generated with causal hypothesis tagging. The system identifies likely root causes based on which domains are affected (e.g., "Database performance issue may be propagating to application errors" when log spikes co-occur with DB anomalies). Rate-limited to one per 30 minutes.
 
-**SLO tracking** (runs on `agg_tick`, hourly) — Data-driven evaluation of all SLO definitions in `collector.slo_definitions`. Each SLO specifies domain, metric, target value, comparison operator (gte/lte), and error budget target percentage. Ten seeded SLOs with 30-day sliding window:
+**SLO tracking** (runs on `agg_tick`, hourly) — Data-driven evaluation of all SLO definitions in `collector.slo_definitions`. Each SLO specifies domain, metric, target value, comparison operator (gte/lte), and error budget target percentage. Ten seeded SLOs with 30-day sliding window.
+
+`api_error_rate` and `api_uptime` SLOs subtract `waf_blocked_requests` from `failed_requests` before computing the error rate and uptime ratios. WAF IP-blocklist and bot-blocklist blocks are security events (the service responded correctly); excluding them prevents bot attacks from generating false SLO breaches.
 
 | SLO | Domain | Target | Comparison | Budget |
 |-----|--------|--------|------------|--------|
@@ -145,11 +151,12 @@ Includes per-table anomaly detection for dead tuple ratio baselines. Deduplicate
 
 Computes error budget as `violations / allowed_violations * 100`. Generates `slo_violation` insights and `slo_breach` alerts when SLOs are not met. Skipped for the first 2 minutes after collector restart to let a few collection cycles populate fresh data. New SLOs can be added by inserting rows into `slo_definitions`.
 
-**Health scores** (runs on `intel_tick`, every 5 min) — Per-domain composite health score (0–100) computed from baseline z-scores. Each baselined metric in a domain gets a component score: 100 (|z| < 1), 80 (|z| < 1.5), 60 (|z| < 2), 40 (|z| < 2.5), 20 (|z| < 3), 0 (|z| >= 3). "Lower is better" metrics (latency, errors, CPU) only penalize positive z-scores (spikes). Domain score is the average of all component scores. Stored in `collector.health_scores` with JSON component breakdown.
+**Health scores** (runs on `intel_tick`, every 5 min) — Per-domain composite health score (0–100) computed as a weighted average of baseline z-score components and breached SLO components. Each baselined metric in a domain gets a component score: 100 (|z| < 1), 80 (|z| < 1.5), 60 (|z| < 2), 40 (|z| < 2.5), 20 (|z| < 3), 0 (|z| >= 3) — weight 1 each. "Lower is better" metrics (latency, errors, CPU) only penalize positive z-scores (spikes). Breached SLOs (met = false) for the domain add weighted penalty components (weight 2): score 50 if budget ≤ 200%, 30 if budget ≤ 400%, 10 if budget > 400%. Only SLOs that are actively breached contribute — SLOs within budget (even at 100% consumed) do not penalize. Domain score = `round(weighted_sum / weighted_count)`. Stored in `collector.health_scores` with JSON component breakdown.
 
-Two special-case overrides prevent false-positive health penalties:
+Three special-case overrides prevent false-positive health penalties:
 - **Cumulative DB counters excluded**: `xact_rollback`, `wal_bytes`, `wal_sync_time`, `checkpoint_write_time`, and `checkpoint_sync_time` are monotonically increasing `pg_stat` accumulators — their absolute values grow over the lifetime of the cluster, making z-score comparison against a rolling baseline meaningless. These metrics are skipped during health score computation for the `db` domain. (`blks_read` was already excluded.)
 - **API `error_rate_pct` uses hourly average**: The raw `api_metrics_raw.error_rate_pct` column stores the cumulative `failed/total` ratio since the last API start. As the total request count grows, this ratio drifts slowly toward zero regardless of current behaviour. Health scoring for `api/error_rate_pct` instead reads `error_rate_avg` from `api_metrics_hourly` (the per-interval average, updated by the restart-safe LAG rollup), which accurately reflects current error rates.
+- **WAF blocks excluded from SLO failure counts**: `api_error_rate` and `api_uptime` health/SLO computations subtract `waf_blocked_requests` from `failed_requests`. Requests blocked by the WAF IP-blocklist or bot-blocklist are security responses (the service operated correctly); counting them as failures would cause bot attacks to depress domain health scores and breach error-rate SLOs falsely.
 
 **Capacity predictions** (runs on `intel_tick`, every 5 min) — Linear regression on 24-hour hourly trends for 15 key metrics. Predicts when values will cross critical thresholds within the next 24 hours. Only alerts when R² >= 0.3 (reasonable trend confidence) and the current value is still below the threshold. Deduplicated to one alert per domain/metric per hour. Stored in `collector.capacity_alerts`.
 
@@ -329,14 +336,14 @@ Seven migration files in `migrations/`:
 **001_collector_schema.sql** — Core tables:
 - `collector.system_metrics_raw` — Host CPU, memory, load, swap, network, disk JSONB (15 columns)
 - `collector.process_metrics_raw` — Per-process CPU, RSS, VSZ, FDs, threads, state, uptime (10 columns)
-- `collector.api_metrics_raw` — API request counts, latency percentiles, errors, cache stats, DB response time (20 columns)
+- `collector.api_metrics_raw` — API request counts, latency percentiles, errors, `waf_blocked_requests`, cache stats, DB response time (21 columns)
 - `collector.proxy_metrics_raw` — Proxy connections, TLS stats, rate limiting, upstream latency (28 columns)
 - `collector.db_metrics_raw` — PostgreSQL connection pool, transaction counts, cache ratios, slow queries (16 base columns)
 - `collector.heartbeat` — Collector liveness tracking
 - `collector.alerts` — Alert storage with deduplication and resolution tracking
 - `collector.system_metrics_hourly` — Hourly system aggregates (CPU, load, memory, network)
 - `collector.process_metrics_hourly` — Hourly per-process aggregates (CPU, RSS, FDs, threads)
-- `collector.api_metrics_hourly` — Hourly API aggregates (RPS, latency percentiles, error rate, request deltas, DB response time)
+- `collector.api_metrics_hourly` — Hourly API aggregates (RPS, latency percentiles, error rate, request deltas including `waf_blocked_requests`, DB response time)
 - `collector.db_metrics_hourly` — Hourly DB aggregates (connections, cache ratio, transaction counts, deadlocks, slow queries)
 - `collector.system_metrics_daily` — Daily system aggregates
 
@@ -379,6 +386,9 @@ Seven migration files in `migrations/`:
 
 **007_collector_self_metrics.sql** — Collector self-monitoring:
 - `collector.collector_self_metrics` — Per-tick telemetry about the collector process itself: PID, uptime, per-buffer depths (10 buffers), total buffer depth, flush count, spill count, disk queue bytes, DB health status, tick duration (ms), total rows written. Indexed by `ts DESC`. Same raw retention as other metrics tables.
+
+**008_waf_blocked_metrics.sql** — WAF block counter columns:
+- Adds `waf_blocked_requests bigint NOT NULL DEFAULT 0` to `collector.api_metrics_raw` and `collector.api_metrics_hourly`. Stores the count of requests rejected by the WAF IP-blocklist and bot-blocklist separately from `failed_requests` so that bot attacks cannot cause false SLO breaches for `api_error_rate` and `api_uptime`.
 
 All tables use `ts TIMESTAMPTZ` as the primary time column with descending indexes for efficient latest-value queries.
 
@@ -450,7 +460,7 @@ The service file runs the binary from `target/release/` directly. Alternatively,
 ### Prerequisites
 
 - PostgreSQL 15+ with the `collector` schema created
-- Run migrations in order: `001_collector_schema.sql`, `002_extended_pg_metrics.sql`, `003_intelligence_schema.sql`, `004_log_tables.sql`, `005_log_enhancements.sql`, `006_intelligence_v2.sql`, `007_collector_self_metrics.sql`
+- Run migrations in order: `001_collector_schema.sql`, `002_extended_pg_metrics.sql`, `003_intelligence_schema.sql`, `004_log_tables.sql`, `005_log_enhancements.sql`, `006_intelligence_v2.sql`, `007_collector_self_metrics.sql`, `008_waf_blocked_metrics.sql`
 - API server running on port 3003 with `/metrics` endpoint
 - Proxy server running on port 8082 with `/metrics/json` endpoint (optional)
 - Read access to log files in `/var/log/` (auth.log, kern.log, postgresql, apache2, fail2ban, letsencrypt, pqcrypta-proxy)
