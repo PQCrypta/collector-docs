@@ -764,6 +764,52 @@ The Event Snapshot tab opens a time-windowed dashboard scoped to the exact momen
 
 **Tooltip system** — all tooltips in the Event Snapshot tab use the same JS tooltip engine (`data-tip` attribute + mouseover delegation, rendered in a fixed-position element appended to `<body>`) as every other dashboard tab. This makes them immune to `overflow: hidden` clipping on chart containers and cards. All elements with `data-tip` automatically receive `cursor: help` via the global `[data-tip] { cursor: help }` CSS rule.
 
+## Web Analytics API
+
+The web analytics system is separate from the collector but operationally related in two ways: the health check cron (whose output the collector ingests via the `health_check` log source) writes sessions into `web_analytics_sessions`, and the collector's own session data feeds the analytics dashboard.
+
+### Health-check session exclusion
+
+The `health_check_cron` binary creates a synthetic session with `session_id = 'health-check-session'` in `web_analytics_sessions` each time it runs (every 5 minutes). Because the session is UPSERTed on each run, its `session_duration` grows to span weeks — `last_seen` advances with every upsert while `created_at` stays fixed at the first run. Without exclusion, this single session inflates the computed average session duration by orders of magnitude (observed: ~1,255,958 s / ~14.5 days).
+
+All session queries in `api/src/handlers/analytics.rs` now filter:
+
+```sql
+WHERE session_id NOT LIKE 'health-check%'
+```
+
+This applies to: `web_analytics_stats_handler`, the `consented_session_query` in `web_analytics_dual_mode_handler`, `web_analytics_browser_os_handler`, `web_analytics_isp_handler`, and `web_analytics_language_handler`.
+
+### Session duration cap
+
+All session duration averages use `LEAST(session_duration, 14400)` (4-hour cap) before averaging, preventing any single zombie or stale session from skewing dashboard stat cards:
+
+```sql
+COALESCE(AVG(LEAST(s.session_duration, 14400)), 0) as avg_session_duration
+```
+
+Legitimate browsing sessions are well under 4 hours. Sessions with durations above this threshold are measurement artifacts (browser restored from a previous day, UPSERT spanning multiple days, etc.).
+
+### Mandatory analytics
+
+Analytics cookies are now required to use the site. The client-side tracker (`pqcrypta-analytics.js`) initializes on every page load without a consent gate. The analytics-init scripts no longer check `CookieConsentManager.checkAnalyticsConsent()`. Consequently, `web_analytics_sessions` captures all visitors rather than only those who explicitly consented.
+
+### Day-boundary session expiry
+
+Client-side sessions stored in `sessionStorage` now expire at day boundaries regardless of the 30-minute inactivity timeout. When the session's stored `startDate` differs from the current date, a new session ID is generated. This prevents a browser session restored from a previous day from reusing a stale session ID, which would UPSERT the old row rather than inserting a new one — causing today's active traffic to fall outside date-range filters that query by `created_at`.
+
+### Path normalisation
+
+The `web_analytics_pages_handler`, `web_analytics_engaged_pages_handler`, and `web_analytics_scroll_behavior_handler` all apply consistent path normalisation before grouping:
+
+- Paths ending without a trailing slash receive one (e.g. `/health-check-test` → `/health-check-test/`)
+- Paths ending with a file extension (`.php`, `.html`, `.js`, etc.) are left unchanged
+- Query strings are stripped via `SPLIT_PART(page_path, '?', 1)`
+
+The `all_page_titles` CTE applies the same normalisation to `page_url` before joining against `consented_pages`. The engaged-pages query groups by the normalised path (column alias position `1`) rather than by `page_path, page_title`, eliminating duplicate rows when the same path has multiple recorded titles.
+
+A static CASE mapping for 45+ known site pages provides title fallback when no recorded title exists for a path.
+
 ## License
 
 MIT
