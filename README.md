@@ -407,6 +407,25 @@ Applied directly to the live database; no migration file required for these perf
 | `idx_key_vault_created_by_cleanup` | `key_vault` | btree | `(created_by, usage_count, created_at)` — key cleanup DELETE scans |
 | `idx_log_fph_level_bucket` | `log_fingerprint_hourly` | btree | `(level, bucket DESC)` — level-filtered fingerprint aggregation |
 
+### Unused-index cleanup (applied 2026-02-23)
+
+The collector's `idx_unused_large` partial-index scan identified **28 indexes** with `idx_scan = 0` and size > 1 MB that had never been used since last stats reset. All were dropped with `DROP INDEX CONCURRENTLY` to reclaim approximately 350 MB of disk space and reduce WAL write amplification on high-update tables. Each was confirmed unused across `collector.index_metrics_raw` before removal.
+
+### Storage and autovacuum tuning (applied 2026-02-23)
+
+Three tables with the highest in-place UPDATE ratios received per-table storage and autovacuum parameters to reduce table bloat and keep heap size stable:
+
+| Table | Setting | Value | Reason |
+|-------|---------|-------|--------|
+| `public.api_rate_limits` | `fillfactor` | 80 | HOT-update headroom for frequent per-key rate window updates |
+| `public.api_rate_limits` | `autovacuum_vacuum_scale_factor` | 0.02 | Trigger vacuum at 2% dead-tuple ratio instead of the default 20% |
+| `public.bot_ip_tracking` | `fillfactor` | 80 | High UPDATE rate on `last_seen` / `request_count` columns |
+| `public.bot_ip_tracking` | `autovacuum_vacuum_scale_factor` | 0.02 | Same threshold reduction |
+| `public.bot_traffic_blocked` | `fillfactor` | 80 | Blocking-event updates on the same rows |
+| `public.bot_traffic_blocked` | `autovacuum_vacuum_scale_factor` | 0.02 | Same threshold reduction |
+
+Settings applied with `ALTER TABLE … SET (…)`. A subsequent `VACUUM ANALYZE public.web_analytics_page_views` was run to clear accumulated dead tuples flagged by the autovacuum-needed recommendation.
+
 ## Deployment
 
 ### systemd
