@@ -307,6 +307,9 @@ heartbeat_secs = 5        # env: HEARTBEAT_INTERVAL_SECS
 [scrape]
 api_metrics_url = "http://127.0.0.1:3003/metrics"      # env: API_METRICS_URL
 proxy_metrics_url = "http://127.0.0.1:8082/metrics/json"  # env: PROXY_METRICS_URL
+# Bearer token for the proxy admin API. Required since the proxy's /metrics/json endpoint
+# is protected (SEC-A02/A03 hardening). Set to match [admin] auth_token in proxy-config.toml.
+proxy_admin_token = ""                                  # env: PROXY_ADMIN_TOKEN
 
 [retention]
 raw_days = 14             # env: RAW_RETENTION_DAYS
