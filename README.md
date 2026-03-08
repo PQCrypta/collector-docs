@@ -282,7 +282,7 @@ Log-specific analysis that runs on `intel_tick` (every 5 minutes), feeding into 
 Health monitoring runs on a dedicated 30s tick, decoupled from the 5s heartbeat:
 - **Heartbeat** (5s): Inserts liveness row into `collector.heartbeat`
 - **Staleness check** (30s): Alerts if last heartbeat exceeds 6x heartbeat interval
-- **Table health** (30s): Detects bloated tables (dead tuples > 20% with > 1000 live rows and > 500 dead rows) and tables not vacuumed in 7+ days
+- **Table health** (30s): Detects bloated tables (dead tuples > 20% with > 1000 live rows and > 500 dead rows) and tables not vacuumed in 4+ days. Uses `GREATEST(last_autovacuum, last_vacuum)` so a recent manual `VACUUM ANALYZE` suppresses the alert even when the older autovacuum timestamp would otherwise trigger it.
 - **Process health** (30s): Checks for high CPU (> 50%), high memory (> 3GB RSS), high FDs (> 1000), high threads (> 500), bad states (zombie/D-state/stopped), and expected processes that are missing. The 3 GB threshold accounts for `pqcrypta-api`'s baseline RSS (~2.4 GB with 31 cryptographic engine libraries and ML models loaded at startup). Condition-based auto-resolve: when a process metric returns to healthy, its alert is resolved immediately (no time-based delay).
 - **API error rate** (30s): Alerts if error rate exceeds 5% with > 100 total requests. Auto-resolves when error rate drops below threshold.
 - **DB response time** (30s): Alerts if 5-minute average DB response time exceeds 100ms. Auto-resolves when response time drops below threshold.
@@ -433,6 +433,18 @@ Three tables with the highest in-place UPDATE ratios received per-table storage 
 | `public.bot_traffic_blocked` | `autovacuum_vacuum_scale_factor` | 0.02 | Same threshold reduction |
 
 Settings applied with `ALTER TABLE … SET (…)`. A subsequent `VACUUM ANALYZE public.web_analytics_page_views` was run to clear accumulated dead tuples flagged by the autovacuum-needed recommendation.
+
+Five low-traffic tables that accumulate dead tuples slowly (below the default 20% scale-factor threshold) received aggressive per-table autovacuum settings so autovacuum triggers within days rather than weeks:
+
+| Table | `autovacuum_vacuum_threshold` | `autovacuum_vacuum_scale_factor` | Reason |
+|-------|-------------------------------|----------------------------------|--------|
+| `public.web_analytics_anonymous_views` | 50 | 0.001 | 194K live rows; 0.1% scale = ~245 dead tuples triggers vacuum (≈3 days at observed rate) |
+| `public.web_analytics_events` | 50 | 0.001 | 38K live rows; default 20% scale would require 7K+ dead tuples — never accumulates that many |
+| `public.smart_contracts` | 10 | 0.001 | Small table; default threshold of 50 exceeded rarely |
+| `public.worker_nodes` | 5 | 0.001 | Near-empty table; any dead tuples should trigger vacuum immediately |
+| `public.collector_runs` | 10 | 0.001 | Append-only table with rare deletes; low threshold catches occasional dead tuples |
+
+`autovacuum_analyze_threshold` and `autovacuum_analyze_scale_factor` set to matching values for each table. The collector's `vacuum_overdue` alert threshold was lowered from 7 days to 4 days, and the staleness check was changed from `COALESCE(last_autovacuum, last_vacuum)` to `GREATEST(last_autovacuum, last_vacuum)` so a recent manual `VACUUM ANALYZE` correctly suppresses the alert.
 
 ## Deployment
 
