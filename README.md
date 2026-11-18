@@ -67,7 +67,7 @@ The fast-path ticks (sys, app, heartbeat) are designed for negligible resource i
 **`process.rs`** — Per-process metrics from `/proc/{pid}/stat` and `/proc/{pid}/fd`. Tracks CPU percentage (delta-based calculation between samples), RSS bytes, VSZ bytes, file descriptor count, thread count, and process state. Collects a configurable list of watched process names plus all other processes with non-zero RSS, sorted by memory usage descending.
 
 **`app.rs`** — Application-level metric collection with two strategies:
-- **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics/json`) endpoints. The proxy admin port (8082) requires `Authorization: Bearer <proxy_admin_token>` — the token is read from `proxy_admin_token` in the `[scrape]` section of `collector.toml` and injected as a request header. Parses `ApiMetrics` (request counts, latency percentiles, error rates, `waf_blocked_requests`, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles). `waf_blocked_requests` tracks requests blocked by the WAF IP-blocklist and bot-blocklist — kept separate from `failed_requests` so bot attacks do not inflate error-rate SLOs.
+- **HTTP scrape**: Fetches JSON from API (`/metrics`) and proxy (`/metrics/json`) endpoints. The proxy admin port (8082) requires `Authorization: Bearer <token>`, and where the proxy's `[admin] hmac_secret` is set every request is signed (`x-admin-signature`, `x-admin-timestamp`, `x-admin-nonce`: hex HMAC-SHA256 of the method, path, timestamp and a fresh nonce). The token and the key are the proxy's sealed systemd credentials `proxy-admin-token` and `proxy-admin-hmac`, which the unit loads (`LoadCredentialEncrypted=`) and the collector reads from `$CREDENTIALS_DIRECTORY`; `PROXY_ADMIN_TOKEN`, `PROXY_ADMIN_HMAC_SECRET` and `[scrape]` in `collector.toml` are read only where no credential is given. Parses `ApiMetrics` (request counts, latency percentiles, error rates, `waf_blocked_requests`, active connections, cache stats, DB response time) and `ProxyMetrics` (connection counts, TLS handshake stats, rate limiting counters, upstream latency percentiles). `waf_blocked_requests` tracks requests blocked by the WAF IP-blocklist and bot-blocklist — kept separate from `failed_requests` so bot attacks do not inflate error-rate SLOs.
 - **Direct PG queries**: Executes against `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_stat_io` (PG16+), `pg_stat_replication`, `pg_stat_statements`, `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_activity` (wait events/locks). Collects 6 tiers of database metrics: connection pool stats, per-table stats (live/dead tuples, seq/idx scans, modifications), per-index stats (scans, reads, fetches, size), per-backend-type IO stats (reads, writes, hits, evictions, fsyncs with timing), replication lag, and statement-level stats (calls, total/mean time, rows).
 
 ### `src/db/`
@@ -226,8 +226,8 @@ Streaming log ingestion engine that polls 13 sources every 15 seconds:
 | `apache_error` | file | `/var/log/apache2/api.pqcrypta.com-error.log` | apache_error |
 | `apache_internal_error` | file | `/var/log/apache2/pqcrypta-internal-error.log` | apache_error |
 | `health_check` | file | `/var/log/pqcrypta_health_check.log` | simple_timestamp |
-| `blocklist` | file | `/var/log/pqcrypta-proxy/blocklist_sync.log` | simple_timestamp |
-| `bot_detection` | file | `/var/log/pqcrypta-proxy/bot_detection.log` | simple_timestamp |
+| `blocklist` | file | `/var/log/pqcrypta/blocklist_sync.log` | simple_timestamp |
+| `bot_detection` | file | `/var/log/pqcrypta/bot_detection.log` | simple_timestamp |
 | `kernel` | file | `/var/log/kern.log` | syslog |
 | `certbot` | file | `/var/log/letsencrypt/letsencrypt.log` | certbot |
 
@@ -282,13 +282,14 @@ Log-specific analysis that runs on `intel_tick` (every 5 minutes), feeding into 
 Health monitoring runs on a dedicated 30s tick, decoupled from the 5s heartbeat:
 - **Heartbeat** (5s): Inserts liveness row into `collector.heartbeat`
 - **Staleness check** (30s): Alerts if last heartbeat exceeds 6x heartbeat interval
-- **Table health** (30s): Detects bloated tables (dead tuples > 20% with > 1000 live rows and > 500 dead rows) and tables not vacuumed in 4+ days. Uses `GREATEST(last_autovacuum, last_vacuum)` so a recent manual `VACUUM ANALYZE` suppresses the alert even when the older autovacuum timestamp would otherwise trigger it.
+- **Table health** (30s): Detects bloated tables (dead tuples > 20% with > 1000 live rows and > 500 dead rows) and tables autovacuum has fallen behind on: dead tuples past the table's own autovacuum trigger point (threshold + scale factor × live rows, per-table reloptions included) with no vacuum for over a day. A quiet table with a few dead rows is below that point by design and raises nothing.
 - **Process health** (30s): Checks for high CPU (> 50%), high memory (> 3GB RSS), high FDs (> 1000), high threads (> 500), bad states (zombie/D-state/stopped), and expected processes that are missing. The 3 GB threshold accounts for `pqcrypta-api`'s baseline RSS (~2.4 GB with 31 cryptographic engine libraries and ML models loaded at startup). Condition-based auto-resolve: when a process metric returns to healthy, its alert is resolved immediately (no time-based delay).
 - **API error rate** (30s): Alerts if error rate exceeds 5% with > 100 total requests. Auto-resolves when error rate drops below threshold.
 - **DB response time** (30s): Alerts if 5-minute average DB response time exceeds 100ms. Auto-resolves when response time drops below threshold.
 - **Long queries** (30s): Queries `pg_stat_activity` for queries running > 30 seconds. Records `long_query` alert with PID, duration, and truncated query text. Auto-resolves when no long queries detected.
 - **Connection trend** (30s): Compares current active connection count to 1 hour ago. Alerts `connection_leak` if connections increased by >50% AND current count exceeds 80% of `max_connections`. Auto-resolves when condition clears.
 - **IO pressure** (30s): Checks for `load_1 > 8.0` combined with high checkpoint write time (>1000ms) or high buffers_backend (>100). Records `io_pressure` alert when both CPU and IO conditions are met. Auto-resolves when conditions clear.
+- **Circuit breaker** (30s): Reads the API's `/health` `circuit_breaker` report. Records `circuit_breaker_tripped` while any algorithm is refused to callers (HTTP 503), and `circuit_breaker_unverified` when the API has no `CIRCUIT_BREAKER_SECRET` or the state file does not verify under it (the API then refuses nothing). The health run itself passes the breaker, so neither its results nor the error-rate check can show a refusal. Auto-resolves when the report is clean.
 
 All watchdog alerts use deduplication (matching alert type + subject prefix) and have both condition-based and time-based auto-resolution fallbacks.
 
@@ -312,9 +313,11 @@ heartbeat_secs = 5        # env: HEARTBEAT_INTERVAL_SECS
 [scrape]
 api_metrics_url = "http://127.0.0.1:3003/metrics"      # env: API_METRICS_URL
 proxy_metrics_url = "http://127.0.0.1:8082/metrics/json"  # env: PROXY_METRICS_URL
-# Bearer token for the proxy admin API. Required since the proxy's /metrics/json endpoint
-# is protected (SEC-A02/A03 hardening). Set to match [admin] auth_token in proxy-config.toml.
+# The proxy admin API's bearer token and signing key, where the unit loads no
+# credential (proxy-admin-token, proxy-admin-hmac: LoadCredentialEncrypted=,
+# which come first and keep both out of this file)
 proxy_admin_token = ""                                  # env: PROXY_ADMIN_TOKEN
+proxy_admin_hmac_secret = ""                            # env: PROXY_ADMIN_HMAC_SECRET
 
 [retention]
 raw_days = 14             # env: RAW_RETENTION_DAYS
@@ -339,7 +342,7 @@ chunk_size = 65536            # bytes to read per file source
 
 ## Database Schema
 
-Seven migration files in `migrations/`:
+Seven migration files in `migrations/`, applied by the collector itself at start and after a reconnect, each once: applied versions are recorded in `collector.schema_migrations`, each file runs in one transaction with `lock_timeout = 10s`, and a file that cannot get its lock (a pg_dump holds share locks for its whole run) is retried every 30 s rather than queueing every write to the table behind it:
 
 **001_collector_schema.sql** — Core tables:
 - `collector.system_metrics_raw` — Host CPU, memory, load, swap, network, disk JSONB (15 columns)
@@ -494,12 +497,12 @@ tracing_subscriber::fmt()
 cargo build --release
 ```
 
-The service file runs the binary from `target/release/` directly. Alternatively, copy to a system path and update `ExecStart`.
+The service runs `/usr/local/bin/pqcrypta-collector`: a `cargo build` changes nothing until the binary is installed there and the service restarted.
 
 ### Prerequisites
 
 - PostgreSQL 15+ with the `collector` schema created
-- Run migrations in order: `001_collector_schema.sql`, `002_extended_pg_metrics.sql`, `003_intelligence_schema.sql`, `004_log_tables.sql`, `005_log_enhancements.sql`, `006_intelligence_v2.sql`, `007_collector_self_metrics.sql`, `008_waf_blocked_metrics.sql`
+- Migrations `001`-`005`, `007` and `008` are applied by the collector on start (see Database Schema); there is no `006`
 - API server running on port 3003 with `/metrics` endpoint
 - Proxy server running on port 8082 with `/metrics/json` endpoint (optional)
 - Read access to log files in `/var/log/` (auth.log, kern.log, postgresql, apache2, fail2ban, letsencrypt, pqcrypta-proxy)
@@ -807,17 +810,13 @@ The Event Snapshot tab opens a time-windowed dashboard scoped to the exact momen
 
 The web analytics system is separate from the collector but operationally related in two ways: the health check cron (whose output the collector ingests via the `health_check` log source) writes sessions into `web_analytics_sessions`, and the collector's own session data feeds the analytics dashboard.
 
-### Health-check session exclusion
+### The health check's beacons
 
-The `health_check_cron` binary creates a synthetic session with `session_id = 'health-check-session'` in `web_analytics_sessions` each time it runs (every 5 minutes). Because the session is UPSERTed on each run, its `session_duration` grows to span weeks — `last_seen` advances with every upsert while `created_at` stays fixed at the first run. Without exclusion, this single session inflates the computed average session duration by orders of magnitude (observed: ~1,255,958 s / ~14.5 days).
+The health check calls `/analytics/web/session`, `/pageview`, `/event`, `/error` and `/heartbeat` every run (every 15 minutes). Each beacon runs its statements on one connection in one transaction: a visitor's is committed, and the health check's (a local request with `x-health-check-bypass`, see `is_local_health_check`) is rolled back. The health check so runs every statement a visitor's beacon runs (the session insert and the `prevent_bot_sessions` trigger, the row's insert and its constraints) and leaves no visit behind. An event or error insert that fails is reported to the health check as a 500; a visitor's stays best-effort.
 
-All session queries in `api/src/handlers/analytics.rs` now filter:
+The pageview, event and error fixtures send a browser user agent, so they pass the bot filter and reach the inserts; the session fixture sends `PQCrypta-Health-Check/1.0` and checks that the filter declines it.
 
-```sql
-WHERE session_id NOT LIKE 'health-check%'
-```
-
-This applies to: `web_analytics_stats_handler`, the `consented_session_query` in `web_analytics_dual_mode_handler`, `web_analytics_browser_os_handler`, `web_analytics_isp_handler`, and `web_analytics_language_handler`.
+Until 2026-10-13 the beacons were committed under one session, `health-check-session` (created 2026-02-07, before the bot filter existed, so every later beacon under it was recorded): 43% of all page views, `/health-check-test/` the third most viewed page, and a session whose duration spanned months. Five session queries excluded it with `session_id NOT LIKE 'health-check%'`; the page, event and error reports did not. Migration 78 deleted its rows and the filters were removed.
 
 ### Session duration cap
 
